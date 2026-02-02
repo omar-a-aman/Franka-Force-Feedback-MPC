@@ -1,0 +1,27 @@
+name: franka-mpc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+
+  # Pin numpy <2 because pinocchio/crocoddyl wheels may still be built against numpy1 ABI
+  - numpy<2
+  - scipy
+  - matplotlib
+  - pandas
+  - tqdm
+  - pyyaml
+
+  # Optimal control stack (paper-consistent)
+  - pinocchio
+  - crocoddyl
+
+  # MuJoCo
+  - mujoco
+
+  # Video / visualization
+  - imageio
+  - imageio-ffmpeg
+
+  # Dev tools
+  - ipython
