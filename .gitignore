@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # python
 __pycache__/
 *.pyc
@@ -21,4 +20,5 @@ results/videos/
 
 # OS
 .DS_Store
-EOF
+
+steps.txt
