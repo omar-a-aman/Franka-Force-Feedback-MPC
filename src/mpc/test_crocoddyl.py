@@ -18,7 +18,7 @@ def main():
     r = float(sim.model.geom_size[sim.ee_geom_id][0])
 
     # keep it slightly ABOVE contact for now (baseline)
-    center = np.array([0.5, 0.0, z_table_top + r + 0.02], dtype=float)
+    center = np.array([-0.5, 0.0, z_table_top + r + 0.02], dtype=float)
     traj = make_circle_trajectory(center=center, radius=0.1, omega=0.8)
 
     cfg = ClassicalMPCConfig(

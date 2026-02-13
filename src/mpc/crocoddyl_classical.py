@@ -183,15 +183,26 @@ class ClassicalCrocoddylMPC:
         for k in range(self.cfg.horizon):
             tk = t0 + k * self.cfg.dt
             p_ref, _ = self.traj_fn(tk)
+
+            # ✅ FIX: mirror x to match Pinocchio-vs-MuJoCo frame convention
+            p_ref = np.asarray(p_ref, dtype=float).copy()
+            p_ref[0] *= -1.0
+
             dam = self._make_dam(p_ref=p_ref, terminal=False)
             iam = crocoddyl.IntegratedActionModelEuler(dam, self.cfg.dt)
             running.append(iam)
 
         pT, _ = self.traj_fn(t0 + self.cfg.horizon * self.cfg.dt)
+
+        # ✅ FIX: mirror terminal ref too
+        pT = np.asarray(pT, dtype=float).copy()
+        pT[0] *= -1.0
+
         terminal_dam = self._make_dam(p_ref=pT, terminal=True)
         terminal = crocoddyl.IntegratedActionModelEuler(terminal_dam, 0.0)
 
         return crocoddyl.ShootingProblem(x0, running, terminal)
+
 
     def _make_dam(self, p_ref: np.ndarray, terminal: bool) -> crocoddyl.DifferentialActionModelAbstract:
         # --- Costs container FIRST (required by Crocoddyl constructor) ---
