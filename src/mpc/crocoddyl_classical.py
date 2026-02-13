@@ -17,6 +17,7 @@ class ClassicalMPCConfig:
 
     # Costs
     w_ee_pos: float = 2.0e3
+    w_ee_ori: float = 8.0e2      # <<< NEW: EE orientation cost
     w_posture: float = 2.0
     w_tau: float = 1.0e-3
 
@@ -27,6 +28,12 @@ class ClassicalMPCConfig:
     max_iters: int = 15
     verbose: bool = False
 
+    # Joint-limit avoidance (soft barrier)
+    w_joint_limits: float = 5.0e2
+    joint_margin: float = 0.10      # [rad] keep this distance away from limits
+    vmax_for_barrier: float = 10.0  # [rad/s] just to bound velocity part of barrier
+
+
 
 class ClassicalCrocoddylMPC:
     """
@@ -36,11 +43,9 @@ class ClassicalCrocoddylMPC:
 
     Costs:
       - EE position tracking
+      - EE orientation tracking (vertical-down tool)
       - posture regularization
       - torque regularization
-
-    NOTE:
-      This is a baseline WITHOUT explicit contact constraints/forces yet.
     """
 
     def __init__(
@@ -69,7 +74,7 @@ class ClassicalCrocoddylMPC:
         self.data: pin.Data = self.model.createData()
 
         self.state = crocoddyl.StateMultibody(self.model)
-        self.actuation = crocoddyl.ActuationModelFull(self.state)  # tau on all nv
+        self.actuation = crocoddyl.ActuationModelFull(self.state)
 
         if self.model.nq != 7 or self.model.nv != 7:
             raise RuntimeError(
@@ -88,6 +93,41 @@ class ClassicalCrocoddylMPC:
             q_nominal = np.array([0.0, -0.758, 0.0, -2.22, 0.0, 1.43, 0.0], dtype=float)
         self.q_nom = q_nominal.copy()
 
+        # Desired EE orientation (world): z-axis down, x-axis aligned with +x
+        self.R_des = self._make_vertical_down_rotation()
+        
+        # -------------------------
+        # Joint limits (arm-only model)
+        # -------------------------
+        self.q_min = self.model.lowerPositionLimit[: self.model.nq].copy()
+        self.q_max = self.model.upperPositionLimit[: self.model.nq].copy()
+
+        # Build a "midpoint" reference to make bounds symmetric in the residual space
+        self.q_mid = 0.5 * (self.q_min + self.q_max)
+
+        # Apply safety margin (avoid getting too close)
+        margin = float(self.cfg.joint_margin)
+        self.q_lo_safe = self.q_min + margin
+        self.q_hi_safe = self.q_max - margin
+
+        # Sanity clamp in case margin is too large for a joint range
+        self.q_lo_safe = np.minimum(self.q_lo_safe, self.q_mid - 1e-3)
+        self.q_hi_safe = np.maximum(self.q_hi_safe, self.q_mid + 1e-3)
+
+        # State reference for the barrier residual
+        self.x_lim_ref = np.concatenate([self.q_mid, np.zeros(self.model.nv)])
+
+        # Bounds are expressed in the *tangent space* at x_lim_ref.
+        # For revolute joints, this is effectively (q - q_mid).
+        q_lb = self.q_lo_safe - self.q_mid
+        q_ub = self.q_hi_safe - self.q_mid
+
+        v_lb = -np.ones(self.model.nv) * float(self.cfg.vmax_for_barrier)
+        v_ub =  np.ones(self.model.nv) * float(self.cfg.vmax_for_barrier)
+
+        self.x_lim_lb = np.concatenate([q_lb, v_lb])
+        self.x_lim_ub = np.concatenate([q_ub, v_ub])
+
         # warm start storage
         self.xs = None
         self.us = None
@@ -96,14 +136,9 @@ class ClassicalCrocoddylMPC:
     # Model helpers
     # -------------------------
     def _make_arm_only_model(self, model_full: pin.Model) -> pin.Model:
-        """
-        Reduce example_robot_data panda (9DoF: 7 arm + 2 fingers)
-        into arm-only (7DoF) by locking finger joints.
-        """
         finger_joint_names = [
             "panda_finger_joint1",
             "panda_finger_joint2",
-            # sometimes named like this in some models:
             "panda_joint_finger_1",
             "panda_joint_finger_2",
         ]
@@ -113,7 +148,6 @@ class ClassicalCrocoddylMPC:
             if model_full.existJointName(jn):
                 lock_joint_ids.append(model_full.getJointId(jn))
 
-        # fallback: lock anything that contains "finger"
         if len(lock_joint_ids) == 0:
             for j in range(1, model_full.njoints):
                 if "finger" in model_full.names[j]:
@@ -141,6 +175,21 @@ class ClassicalCrocoddylMPC:
             + ("\n... (truncated)" if len(frame_names) > 80 else "")
         )
 
+    def _make_vertical_down_rotation(self) -> np.ndarray:
+        """
+        World-frame desired rotation:
+          - EE z-axis points DOWN: [0,0,-1]
+          - EE x-axis aligned with world +x: [1,0,0]
+        """
+        z = np.array([0.0, 0.0, -1.0])
+        x = np.array([1.0, 0.0,  0.0])
+        y = np.cross(z, x)
+        y = y / (np.linalg.norm(y) + 1e-12)
+        x = np.cross(y, z)
+        x = x / (np.linalg.norm(x) + 1e-12)
+        R = np.column_stack([x, y, z])
+        return R
+
     # -------------------------
     # MPC public API
     # -------------------------
@@ -152,12 +201,8 @@ class ClassicalCrocoddylMPC:
         problem = self._build_problem(t0=t, x0=x0)
 
         solver = crocoddyl.SolverFDDP(problem)
-        if self.cfg.verbose:
-            solver.setCallbacks([crocoddyl.CallbackVerbose()])
-        else:
-            solver.setCallbacks([])
+        solver.setCallbacks([crocoddyl.CallbackVerbose()] if self.cfg.verbose else [])
 
-        # warm start
         if self.xs is None or self.us is None:
             xs_init = [x0.copy() for _ in range(self.cfg.horizon + 1)]
             us_init = [np.zeros(self.model.nv) for _ in range(self.cfg.horizon)]
@@ -167,7 +212,6 @@ class ClassicalCrocoddylMPC:
 
         solver.solve(xs_init, us_init, self.cfg.max_iters, False)
 
-        # store warm start (shift will happen naturally because next x0 changes)
         self.xs = solver.xs
         self.us = solver.us
 
@@ -184,17 +228,14 @@ class ClassicalCrocoddylMPC:
             tk = t0 + k * self.cfg.dt
             p_ref, _ = self.traj_fn(tk)
 
-            # ✅ FIX: mirror x to match Pinocchio-vs-MuJoCo frame convention
+            # mirror x to match your Pinocchio-vs-MuJoCo convention
             p_ref = np.asarray(p_ref, dtype=float).copy()
             p_ref[0] *= -1.0
 
             dam = self._make_dam(p_ref=p_ref, terminal=False)
-            iam = crocoddyl.IntegratedActionModelEuler(dam, self.cfg.dt)
-            running.append(iam)
+            running.append(crocoddyl.IntegratedActionModelEuler(dam, self.cfg.dt))
 
         pT, _ = self.traj_fn(t0 + self.cfg.horizon * self.cfg.dt)
-
-        # ✅ FIX: mirror terminal ref too
         pT = np.asarray(pT, dtype=float).copy()
         pT[0] *= -1.0
 
@@ -203,28 +244,44 @@ class ClassicalCrocoddylMPC:
 
         return crocoddyl.ShootingProblem(x0, running, terminal)
 
-
     def _make_dam(self, p_ref: np.ndarray, terminal: bool) -> crocoddyl.DifferentialActionModelAbstract:
-        # --- Costs container FIRST (required by Crocoddyl constructor) ---
         costs = crocoddyl.CostModelSum(self.state, self.model.nv)
 
-        # EE translation tracking: p(frame) - p_ref
-        r_ee = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.model.nv)
-        c_ee = crocoddyl.CostModelResidual(self.state, r_ee)
-        costs.addCost("ee_pos", c_ee, self.cfg.w_ee_pos)
+        # --- EE position tracking ---
+        r_pos = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.model.nv)
+        c_pos = crocoddyl.CostModelResidual(self.state, r_pos)
+        costs.addCost("ee_pos", c_pos, self.cfg.w_ee_pos)
 
-        # posture regularization: (q,v) -> (q_nom, 0)
+        # --- EE orientation tracking (rotation-only) ---
+        # Use FramePlacement residual (6D), but activate only rotation components (last 3)
+        # ref placement uses desired rotation + current p_ref (translation ignored by activation weights anyway)
+        pref_se3 = pin.SE3(self.R_des, p_ref)
+
+        r_place = crocoddyl.ResidualModelFramePlacement(self.state, self.ee_fid, pref_se3, self.model.nv)
+        act_rot_only = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]))
+        c_ori = crocoddyl.CostModelResidual(self.state, act_rot_only, r_place)
+        costs.addCost("ee_ori", c_ori, self.cfg.w_ee_ori)
+
+        # --- posture regularization ---
         x_ref = np.concatenate([self.q_nom, np.zeros(self.model.nv)])
         r_x = crocoddyl.ResidualModelState(self.state, x_ref, self.model.nv)
         c_x = crocoddyl.CostModelResidual(self.state, r_x)
         costs.addCost("posture", c_x, self.cfg.w_posture)
 
-        # torque regularization
+        # --- joint-limit avoidance (soft barrier on state) ---
+        # residual is state difference around x_lim_ref, barrier enforces bounds
+        r_lim = crocoddyl.ResidualModelState(self.state, self.x_lim_ref, self.model.nv)
+        act_lim = crocoddyl.ActivationModelQuadraticBarrier(
+            crocoddyl.ActivationBounds(self.x_lim_lb, self.x_lim_ub)
+        )
+        c_lim = crocoddyl.CostModelResidual(self.state, act_lim, r_lim)
+        costs.addCost("joint_limits", c_lim, self.cfg.w_joint_limits)
+
+        # --- torque regularization ---
         if not terminal:
             r_u = crocoddyl.ResidualModelControl(self.state, self.model.nv)
             c_u = crocoddyl.CostModelResidual(self.state, r_u)
             costs.addCost("tau_reg", c_u, self.cfg.w_tau)
 
-        # --- Correct constructor call (THIS FIXES YOUR ERROR) ---
         dam = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, costs)
         return dam

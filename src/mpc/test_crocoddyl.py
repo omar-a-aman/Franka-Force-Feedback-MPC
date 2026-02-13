@@ -19,7 +19,7 @@ def main():
 
     # keep it slightly ABOVE contact for now (baseline)
     center = np.array([-0.5, 0.0, z_table_top + r + 0.02], dtype=float)
-    traj = make_circle_trajectory(center=center, radius=0.1, omega=0.8)
+    traj = make_circle_trajectory(center=center, radius=0.2, omega=0.8)
 
     cfg = ClassicalMPCConfig(
         horizon=15,
