@@ -46,7 +46,7 @@ def main(no_viewer: bool = False, total_time: float = 40.0):
     z_contact = z_table_top + r_tool - 0.0010  # slight penetration target
     z_pre = z_contact + 0.06
 
-    radius = 0.04
+    radius = 0.06
     omega = 0.6
     margin = radius + 0.03
 
@@ -55,7 +55,7 @@ def main(no_viewer: bool = False, total_time: float = 40.0):
     y_min = float(table_center[1] - table_half[1] + margin)
     y_max = float(table_center[1] + table_half[1] - margin)
 
-    center_x = _clamp(obs.ee_pos[0], x_min, x_max)
+    center_x = float(table_center[0]) #_clamp(obs.ee_pos[0], x_min, x_max)
     center_y = _clamp(obs.ee_pos[1], y_min, y_max)
     center = np.array([center_x, center_y, z_contact], dtype=float)
 
@@ -133,7 +133,7 @@ def main(no_viewer: bool = False, total_time: float = 40.0):
         log_data["ee_vel_z"].append(float(obs_next.ee_vel[2]))
         log_data["f_contact_normal"].append(float(obs_next.f_contact_normal))
 
-        if k % 100 == 0:
+        if k % 5 == 0:
             p_ref, _, surf = traj(t_next)
             err = np.linalg.norm(obs_next.ee_pos - p_ref)
             print(
@@ -179,6 +179,6 @@ def main(no_viewer: bool = False, total_time: float = 40.0):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--no-viewer", action="store_true", help="Run without MuJoCo viewer.")
-    parser.add_argument("--time", type=float, default=12.0, help="Total simulation time [s].")
+    parser.add_argument("--time", type=float, default=40.0, help="Total simulation time [s].")
     args = parser.parse_args()
     main(no_viewer=args.no_viewer, total_time=args.time)
