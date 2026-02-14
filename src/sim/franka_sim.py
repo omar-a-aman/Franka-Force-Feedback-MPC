@@ -12,27 +12,25 @@ import mujoco
 class Observation:
     q: np.ndarray                 # (7,)
     dq: np.ndarray                # (7,)
-    tau_meas: np.ndarray          # (7,) proxy (actuator generalized forces)
-    f_contact_world: np.ndarray   # (3,) total contact force on ee_collision, world frame (force ON EE)
-    f_contact_normal: float       # scalar normal component (>=0) (force ON EE)
-    ee_pos: Optional[np.ndarray] = None   # (3,)
-    ee_quat: Optional[np.ndarray] = None  # (4,) (w, x, y, z)
-    J_pos: Optional[np.ndarray] = None    # (3,7)
-    J_rot: Optional[np.ndarray] = None    # (3,7)
+    tau_meas: np.ndarray          # (7,) applied torque in torque mode
+    tau_bias: np.ndarray          # (7,) mujoco bias torque (gravity+coriolis)
+    f_contact_world: np.ndarray   # (3,) total contact force ON ee geom, world
+    f_contact_normal: float       # scalar normal magnitude (>=0)
+
+    ee_pos: Optional[np.ndarray] = None    # (3,)
+    ee_quat: Optional[np.ndarray] = None   # (4,) (w,x,y,z)
+    J_pos: Optional[np.ndarray] = None     # (3,7)
+    J_rot: Optional[np.ndarray] = None     # (3,7)
+    ee_vel: Optional[np.ndarray] = None    # (3,) world linear vel of ee_site
 
 
 class FrankaMujocoSim:
     """
     Minimal MuJoCo wrapper for Franka Panda tasks.
 
-    API:
-      - reset(keyframe="neutral") -> Observation
-      - step(u) -> Observation
-      - get_observation(with_ee=True, with_jacobian=False) -> Observation
-
-    command_type:
-      - "pos": uses data.ctrl as position targets
-      - "torque": applies joint torques via data.qfrc_applied on the 7 arm DoFs
+    torque mode:
+      - applies u (7,) directly to qfrc_applied for the 7 arm DoFs
+      - returns tau_bias so controllers can do gravity compensation
     """
 
     def __init__(
@@ -54,7 +52,7 @@ class FrankaMujocoSim:
         self.command_type = command_type
         self.n_substeps = int(n_substeps)
 
-        # ---- Resolve joint DoFs for the 7 arm joints ----
+        # 7 arm joints
         if arm_joint_names is None:
             arm_joint_names = [f"joint{i}" for i in range(1, 8)]
         self.joint_names = arm_joint_names
@@ -67,7 +65,7 @@ class FrankaMujocoSim:
         self.qpos_adr = [int(self.model.jnt_qposadr[j]) for j in self.jnt_ids]
         self.dof_adr = [int(self.model.jnt_dofadr[j]) for j in self.jnt_ids]
 
-        # ---- Resolve actuators for the 7 arm joints ----
+        # actuators (only used in pos mode)
         if arm_actuator_names is None:
             arm_actuator_names = [f"actuator{i}" for i in range(1, 8)]
         self.actuator_names = arm_actuator_names
@@ -77,19 +75,22 @@ class FrankaMujocoSim:
             missing = [n for n, a in zip(self.actuator_names, self.act_ids) if a < 0]
             raise ValueError(f"Missing actuator(s) in XML: {missing}")
 
-        # ---- EE site + collision geom ----
+        # EE site + collision geom
         self.ee_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, ee_site_name)
         if self.ee_site_id < 0:
-            raise ValueError(f"Missing site '{ee_site_name}' (needed for EE pose/Jacobian)")
+            raise ValueError(f"Missing site '{ee_site_name}'")
 
         self.ee_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, ee_collision_geom_name)
         if self.ee_geom_id < 0:
-            raise ValueError(f"Missing geom '{ee_collision_geom_name}' (needed for EE contact force)")
+            raise ValueError(f"Missing geom '{ee_collision_geom_name}'")
 
-        # If torque mode: disable actuator contribution (so ctrl doesn't create forces)
+        # In torque mode we want qfrc_applied to be the only actuation source.
+        # Panda's default actuators are position servos with nonzero bias terms;
+        # leaving them enabled injects large hidden torques even when ctrl is zero.
         if self.command_type == "torque":
-            self.model.actuator_gainprm[:, :] = 0.0
-            self.model.actuator_biasprm[:, :] = 0.0
+            self.data.ctrl[:] = 0.0
+            self.model.actuator_gainprm[self.act_ids, :] = 0.0
+            self.model.actuator_biasprm[self.act_ids, :] = 0.0
 
         mujoco.mj_forward(self.model, self.data)
 
@@ -100,13 +101,17 @@ class FrankaMujocoSim:
     def reset(self, keyframe: str = "neutral") -> Observation:
         kf_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, keyframe)
         if kf_id < 0:
-            raise ValueError(f"Keyframe '{keyframe}' not found in model keyframes.")
+            raise ValueError(f"Keyframe '{keyframe}' not found.")
         mujoco.mj_resetDataKeyframe(self.model, self.data, kf_id)
+
+        self.data.qfrc_applied[:] = 0.0
+        self.data.ctrl[:] = 0.0
+
         mujoco.mj_forward(self.model, self.data)
         return self.get_observation(with_ee=True, with_jacobian=True)
 
     def step(self, u: np.ndarray) -> Observation:
-        u = np.asarray(u, dtype=np.float64).copy()
+        u = np.asarray(u, dtype=np.float64).reshape(-1).copy()
 
         if self.command_type == "pos":
             if u.shape == (7,):
@@ -115,17 +120,14 @@ class FrankaMujocoSim:
             elif u.shape == (self.model.nu,):
                 self.data.ctrl[:] = u
             else:
-                raise ValueError(f"For command_type='pos', u must be shape (7,) or (nu,), got {u.shape}")
-
+                raise ValueError(f"pos mode expects (7,) or (nu,), got {u.shape}")
             self.data.qfrc_applied[:] = 0.0
 
-        else:  # "torque"
+        else:  # torque mode
             if u.shape != (7,):
-                raise ValueError(f"For command_type='torque', u must be shape (7,), got {u.shape}")
+                raise ValueError(f"torque mode expects (7,), got {u.shape}")
 
             self.data.ctrl[:] = 0.0
-            self.data.ctrl[self.act_ids] = self.data.qpos[self.qpos_adr]
-
             self.data.qfrc_applied[:] = 0.0
             for k, dof in enumerate(self.dof_adr):
                 self.data.qfrc_applied[dof] = u[k]
@@ -135,22 +137,36 @@ class FrankaMujocoSim:
 
         return self.get_observation(with_ee=True, with_jacobian=True)
 
+    def bias_torque(self) -> np.ndarray:
+        """Return MuJoCo bias torques (gravity + Coriolis) for arm joints."""
+        return self.data.qfrc_bias[self.dof_adr].copy()
+
     def get_observation(self, with_ee: bool = True, with_jacobian: bool = False) -> Observation:
         q = self.data.qpos[self.qpos_adr].copy()
         dq = self.data.qvel[self.dof_adr].copy()
-        tau_meas = self.data.qfrc_actuator[self.dof_adr].copy()
+
+        tau_bias = self.data.qfrc_bias[self.dof_adr].copy()
+
+        if self.command_type == "torque":
+            tau_meas = self.data.qfrc_applied[self.dof_adr].copy()
+        else:
+            tau_meas = self.data.qfrc_actuator[self.dof_adr].copy()
 
         f_world, f_normal = self._ee_contact_force_world()
 
-        ee_pos = None
-        ee_quat = None
-        J_pos = None
-        J_rot = None
+        ee_pos = ee_quat = ee_vel = None
+        J_pos = J_rot = None
 
         if with_ee:
             ee_pos = self.data.site_xpos[self.ee_site_id].copy()
             xmat = self.data.site_xmat[self.ee_site_id].reshape(3, 3)
             ee_quat = self._mat_to_quat_wxyz(xmat)
+
+            # EE world linear velocity from jacobian * qvel
+            jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+            jacr = np.zeros((3, self.model.nv), dtype=np.float64)
+            mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self.ee_site_id)
+            ee_vel = (jacp @ self.data.qvel).copy()
 
         if with_jacobian:
             jacp = np.zeros((3, self.model.nv), dtype=np.float64)
@@ -163,31 +179,22 @@ class FrankaMujocoSim:
             q=q,
             dq=dq,
             tau_meas=tau_meas,
+            tau_bias=tau_bias,
             f_contact_world=f_world,
             f_contact_normal=float(f_normal),
             ee_pos=ee_pos,
             ee_quat=ee_quat,
+            ee_vel=ee_vel,
             J_pos=J_pos,
             J_rot=J_rot,
         )
 
-    def bias_torque(self) -> np.ndarray:
-        return self.data.qfrc_bias[self.dof_adr].copy()
-
     def _ee_contact_force_world(self) -> Tuple[np.ndarray, float]:
         """
-        Returns:
-        f_world_total: (3,) total contact force ON ee_collision geom in world coords
-        f_normal_total: scalar normal force magnitude (>=0) accumulated over contacts
-
-        Notes:
-        - MuJoCo contact.frame normal points from geom1 -> geom2.
-        - mj_contactForce gives components in the contact frame; we reconstruct a world force vector.
-        - The returned vector from reconstruction is treated as the force ON geom2.
-            Therefore:
-            - if EE is geom2 -> force_on_ee = +f_w
-            - if EE is geom1 -> force_on_ee = -f_w
-        - For the scalar normal force, your controller wants a magnitude: use abs(fn).
+        Returns force ON ee_collision geom in world coordinates.
+        Correct MuJoCo conventions:
+          mj_contactForce -> cf[0]=normal, cf[1]=friction1, cf[2]=friction2 (in contact frame)
+          contact.frame: 3x3 where first column is normal, next two are tangents (world coords)
         """
         f_world_total = np.zeros(3, dtype=np.float64)
         f_normal_total = 0.0
@@ -201,18 +208,17 @@ class FrankaMujocoSim:
             mujoco.mj_contactForce(self.model, self.data, i, cf)
 
             fr = np.asarray(c.frame, dtype=np.float64)
-            n_world  = fr[0:3]
+            n_world = fr[0:3]
             t1_world = fr[3:6]
             t2_world = fr[6:9]
 
-            ft1 = float(cf[0])
-            ft2 = float(cf[1])
-            fn  = float(cf[2])  # normal component along n_world (geom1->geom2)
+            fn = float(cf[0])   # <-- FIXED
+            ft1 = float(cf[1])
+            ft2 = float(cf[2])
 
-            # Reconstruct world force (interpreted as force ON geom2)
-            f_w_on_geom2 = t1_world * ft1 + t2_world * ft2 + n_world * fn
+            f_w_on_geom2 = n_world * fn + t1_world * ft1 + t2_world * ft2
 
-            # Flip if EE is geom1
+            # convert to force ON ee geom
             if c.geom2 == self.ee_geom_id:
                 f_w_on_ee = f_w_on_geom2
             else:
@@ -222,7 +228,6 @@ class FrankaMujocoSim:
             f_normal_total += abs(fn)
 
         return f_world_total, f_normal_total
-
 
     @staticmethod
     def _mat_to_quat_wxyz(R: np.ndarray) -> np.ndarray:
