@@ -18,6 +18,8 @@ class ClassicalMPCConfig:
     # free-space tracking (approach phase)
     w_ee_pos: float = 2.0e2
     w_ee_ori: float = 1.0e1
+    # Orientation residual weights [roll, pitch, yaw]. Keep yaw lighter for sanding.
+    ori_weights: np.ndarray = field(default_factory=lambda: np.array([2.0, 2.0, 0.15], dtype=float))
 
     # regularization
     w_posture: float = 5.0e-1
@@ -51,6 +53,8 @@ class ClassicalMPCConfig:
 
     # orientation stabilization (extra damping)
     w_wdamp: float = 2.0e1           # angular velocity damping weight
+    # Angular-rate damping weights [wx, wy, wz]; keep wz lighter to allow yaw motion.
+    w_wdamp_weights: np.ndarray = field(default_factory=lambda: np.array([1.5, 1.5, 0.2], dtype=float))
 
 
     # surface detection
@@ -415,14 +419,16 @@ class ClassicalCrocoddylMPC:
 
         # --- orientation stabilization: pose + angular velocity damping ---
         r_rot = crocoddyl.ResidualModelFrameRotation(self.state, self.ee_fid, self.R_des, self.actuation.nu)
-        costs.addCost("ee_ori", crocoddyl.CostModelResidual(self.state, r_rot), self.cfg.w_ee_ori)
+        act_rot = crocoddyl.ActivationModelWeightedQuad(np.asarray(self.cfg.ori_weights, dtype=float))
+        costs.addCost("ee_ori", crocoddyl.CostModelResidual(self.state, act_rot, r_rot), self.cfg.w_ee_ori)
 
         # angular velocity damping (LOCAL_WORLD_ALIGNED; penalize only rotational part)
         m_w0 = pin.Motion(np.zeros(3), np.zeros(3))
         r_w = crocoddyl.ResidualModelFrameVelocity(
             self.state, self.ee_fid, m_w0, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu
         )
-        act_w = crocoddyl.ActivationModelWeightedQuad(np.array([0, 0, 0, 1, 1, 1], dtype=float))
+        ww = np.asarray(self.cfg.w_wdamp_weights, dtype=float).reshape(3)
+        act_w = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 0.0, ww[0], ww[1], ww[2]], dtype=float))
         costs.addCost("w_damp", crocoddyl.CostModelResidual(self.state, act_w, r_w), self.cfg.w_wdamp)
 
         if not terminal:
