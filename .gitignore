@@ -13,6 +13,7 @@ __pycache__/
 results/logs/
 results/plots/
 results/videos/
+results/classical_eval/
 
 # editors
 .vscode/
