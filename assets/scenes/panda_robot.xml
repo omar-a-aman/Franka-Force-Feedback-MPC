@@ -191,6 +191,7 @@
                         <geom name="ee_collision"
                               type="sphere"
                               size="0.03"
+                              friction="1 0.005 0.0001"
                               contype="1"
                               conaffinity="1"
                               rgba="1 0 0 0.3"/>

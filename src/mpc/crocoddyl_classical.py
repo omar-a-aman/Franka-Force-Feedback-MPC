@@ -27,11 +27,31 @@ class ClassicalMPCConfig:
 
     # contact phase objectives
     z_contact: float = 0.35
-    z_press: float = 0.0070
+    z_press: float = 0.0020
     w_plane_z: float = 6.0e3
     w_vz: float = 6.0e2
     w_tangent_pos: float = 2.0e2
     w_tangent_vel: float = 1.0e2
+
+    # contact modeling (Crocoddyl contact dynamics)
+    contact_name: str = "ee_contact"
+    # "normal_1d" keeps unilateral normal contact and allows tangential sliding
+    # (required for circle-on-surface tasks). "point3d" enforces no-slip point contact.
+    contact_model: str = "normal_1d"
+    mu: float = 0.6                  # friction coefficient
+    friction_margin: float = 1e-3    # slack
+    w_friction_cone: float = 2.0e2
+    w_unilateral: float = 5.0e1
+    contact_gains: np.ndarray = field(default_factory=lambda: np.array([0.0, 60.0], dtype=float))
+    contact_inv_damping: float = 1.0e-8
+
+    # optional: classic baseline "desired normal force" (ONLY after contact modeling works)
+    fn_des: float = 8.0
+    w_fn: float = 2.0e1
+
+    # orientation stabilization (extra damping)
+    w_wdamp: float = 2.0e1           # angular velocity damping weight
+
 
     # surface detection
     fn_contact_on: float = 2.0
@@ -51,8 +71,14 @@ class ClassicalMPCConfig:
 
     # solver
     max_iters: int = 20
+    use_box_fddp: bool = True
     verbose: bool = False
     debug_every: int = 25
+    # numerical safety guard for solver blow-ups
+    max_solver_cost: float = 1.0e8
+    max_tau_raw_inf: float = 3.0e2
+    fallback_dq_damping: float = 5.0
+    contact_release_steps: int = 25
 
 
 class ClassicalCrocoddylMPC:
@@ -105,6 +131,22 @@ class ClassicalCrocoddylMPC:
 
         # Surface mode latch (hysteresis).
         self._surface_latched = False
+        self._contact_loss_count = 0
+        self._prev_surface_mode: Optional[bool] = None
+        # Hold circle start until physical contact is detected.
+        self._precontact_hold_mj: Optional[np.ndarray] = None
+        # If measured force is temporarily lost in contact phase, freeze XY reference to avoid runaway chasing.
+        self._contact_recovery_hold_mj: Optional[np.ndarray] = None
+        self.last_info = {
+            "ok": False,
+            "cost": np.nan,
+            "iters": -1,
+            "tau_raw_inf": np.nan,
+            "tau_cmd_inf": np.nan,
+            "surface_mode": False,
+            "unstable": False,
+            "fn_pred": np.nan,
+        }
 
     def _make_arm_only_model(self, model_full: pin.Model) -> pin.Model:
         lock_joint_ids = []
@@ -185,20 +227,22 @@ class ClassicalCrocoddylMPC:
         self._tau_prev = tau_cmd.copy()
         return tau_cmd
 
-    def _detect_surface(self, obs, t: float) -> bool:
-        _, _, surf_hint = self.traj_fn(t)
-
+    def _detect_surface(self, obs, t: float, surf_hint: bool) -> bool:
         fn = float(getattr(obs, "f_contact_normal", 0.0))
-        ee_z = float(obs.ee_pos[2]) if getattr(obs, "ee_pos", None) is not None else 1e9
-        z_target = float(self.cfg.z_contact) - float(self.cfg.z_press)
-        near_plane = abs(ee_z - z_target) < float(self.cfg.z_contact_band)
+        ee_z = float(obs.ee_pos[2]) if getattr(obs, "ee_pos", None) is not None else float("inf")
+        near_surface = np.isfinite(ee_z) and (ee_z <= float(self.cfg.z_contact) + float(self.cfg.z_contact_band))
 
         if self._surface_latched:
-            if (fn < self.cfg.fn_contact_off) and (not near_plane) and (not surf_hint):
+            lost_contact = fn < self.cfg.fn_contact_off
+            self._contact_loss_count = self._contact_loss_count + 1 if lost_contact else 0
+            if self._contact_loss_count >= int(self.cfg.contact_release_steps):
                 self._surface_latched = False
+                self._contact_loss_count = 0
         else:
-            if (fn > self.cfg.fn_contact_on) or (near_plane and surf_hint):
+            # Allow a robust latch either from measured force or from proximity once contact phase starts.
+            if (fn > self.cfg.fn_contact_on) or (surf_hint and near_surface):
                 self._surface_latched = True
+                self._contact_loss_count = 0
 
         return self._surface_latched
 
@@ -209,55 +253,125 @@ class ClassicalCrocoddylMPC:
         v = np.asarray(obs.dq, dtype=float)
         x0 = np.concatenate([q, v])
 
-        surface_now = self._detect_surface(obs, t)
+        p_now, _, surf_hint_now = self.traj_fn(t)
+        surface_now = self._detect_surface(obs, t, surf_hint_now)
+        if self._prev_surface_mode is None:
+            self._prev_surface_mode = bool(surface_now)
+        elif bool(surface_now) != bool(self._prev_surface_mode):
+            # Mode switches invalidate the shifted warm start.
+            self.xs = None
+            self.us = None
+            self._prev_surface_mode = bool(surface_now)
+        if surface_now:
+            self._precontact_hold_mj = None
+            fn_now = float(getattr(obs, "f_contact_normal", 0.0))
+            if surf_hint_now and (fn_now < self.cfg.fn_contact_off):
+                if self._contact_recovery_hold_mj is None:
+                    self._contact_recovery_hold_mj = np.asarray(obs.ee_pos, dtype=float).copy()
+                    self._contact_recovery_hold_mj[2] = float(self.cfg.z_contact) - float(self.cfg.z_press)
+            else:
+                self._contact_recovery_hold_mj = None
+        elif surf_hint_now:
+            if self._precontact_hold_mj is None:
+                self._precontact_hold_mj = np.asarray(p_now, dtype=float).copy()
+                self._precontact_hold_mj[2] = float(self.cfg.z_contact) - float(self.cfg.z_press)
+            self._contact_recovery_hold_mj = None
+        else:
+            self._precontact_hold_mj = None
+            self._contact_recovery_hold_mj = None
+
+        # Build (or rebuild) the shooting problem for this tick
         problem = self._build_problem(t0=t, x0=x0, surface_now=surface_now)
-        solver = crocoddyl.SolverFDDP(problem)
-        if self.cfg.verbose:
-            solver.setCallbacks([crocoddyl.CallbackVerbose()])
+
+        # (Recommended) reuse solver object if possible
+        # Reuse solver if the Python API supports updating the problem; otherwise recreate it.
+        if not hasattr(self, "_solver") or self._solver is None:
+            self._solver = self._make_solver(problem)
+            if self.cfg.verbose:
+                self._solver.setCallbacks([crocoddyl.CallbackVerbose()])
+        else:
+            if hasattr(self._solver, "setProblem"):
+                self._solver.setProblem(problem)
+            else:
+                # Older Crocoddyl python bindings: no setProblem() -> rebuild solver each tick
+                self._solver = self._make_solver(problem)
+                if self.cfg.verbose:
+                    self._solver.setCallbacks([crocoddyl.CallbackVerbose()])
+
+        solver = self._solver
 
         N = self.cfg.horizon
-        if self.xs is None or self.us is None:
-            xs_init = [x0.copy() for _ in range(N + 1)]
-            us_init = [self._tau_prev.copy() for _ in range(N)]
-        else:
-            xs_init = [self.xs[i].copy() if i < len(self.xs) else x0.copy() for i in range(1, N + 1)]
-            xs_init.insert(0, x0.copy())
-            us_init = [self.us[i].copy() if i < len(self.us) else self._tau_prev.copy() for i in range(1, N)]
-            us_init.append(self.us[-1].copy() if len(self.us) > 0 else self._tau_prev.copy())
+
+        # Proper shifted warm start
+        xs_init, us_init = self._shift_guess(x0, N)
 
         ok = solver.solve(xs_init, us_init, self.cfg.max_iters, False)
+        fn_pred = self._extract_predicted_normal_force(problem) if surface_now else np.nan
 
         tau_raw = self._tau_prev.copy()
+        cost = float(getattr(solver, "cost", np.nan))
         if len(solver.us) > 0:
             u0 = np.asarray(solver.us[0], dtype=float).copy()
             if np.all(np.isfinite(u0)):
                 tau_raw = u0
+                # store full solution for next warm start
                 self.xs = [np.asarray(xi, dtype=float).copy() for xi in solver.xs]
                 self.us = [np.asarray(ui, dtype=float).copy() for ui in solver.us]
 
+        # Hard safety fallback if solver diverges numerically.
+        tau_raw_inf = float(np.max(np.abs(tau_raw)))
+        unstable = (not np.isfinite(cost)) or (cost > float(self.cfg.max_solver_cost)) or (tau_raw_inf > float(self.cfg.max_tau_raw_inf))
+        if unstable:
+            tau_raw = np.asarray(obs.tau_bias, dtype=float) - float(self.cfg.fallback_dq_damping) * v
+            self.xs = None
+            self.us = None
+
         tau_cmd = self._safe_tau(tau_raw)
+        iters = int(getattr(solver, "iter", -1))
+        tau_cmd_inf = float(np.max(np.abs(tau_cmd)))
+        self.last_info = {
+            "ok": bool(ok),
+            "cost": float(cost),
+            "iters": iters,
+            "tau_raw_inf": tau_raw_inf,
+            "tau_cmd_inf": tau_cmd_inf,
+            "surface_mode": bool(surface_now),
+            "unstable": bool(unstable),
+            "fn_pred": float(fn_pred) if np.isfinite(fn_pred) else np.nan,
+        }
 
         if (self._k % self.cfg.debug_every) == 0:
-            cost = float(getattr(solver, "cost", np.nan))
-            iters = int(getattr(solver, "iter", -1))
             fn = float(getattr(obs, "f_contact_normal", 0.0))
+            ee_z = float(obs.ee_pos[2]) if getattr(obs, "ee_pos", None) is not None else np.nan
             print(
                 f"[MPC] t={t:6.3f} ok={ok} cost={cost:.2e} iters={iters:2d} "
                 f"|tau_raw|∞={np.max(np.abs(tau_raw)):.2f} |tau_cmd|∞={np.max(np.abs(tau_cmd)):.2f} "
-                f"surf={int(surface_now)} fn={fn:.2f} ee_z={obs.ee_pos[2]:.4f}"
+                f"surf={int(surface_now)} fn={fn:.2f} fn_pred={fn_pred:.2f} ee_z={ee_z:.4f} unstable={int(unstable)}"
             )
 
         return tau_cmd
+
+    def _make_solver(self, problem: crocoddyl.ShootingProblem):
+        if self.cfg.use_box_fddp and hasattr(crocoddyl, "SolverBoxFDDP"):
+            return crocoddyl.SolverBoxFDDP(problem)
+        return crocoddyl.SolverFDDP(problem)
 
     def _build_problem(self, t0: float, x0: np.ndarray, surface_now: bool) -> crocoddyl.ShootingProblem:
         running = []
         for k in range(self.cfg.horizon):
             tk = t0 + k * self.cfg.dt
             p_ref_mj, v_ref_mj, surf_hint = self.traj_fn(tk)
+            if (not surface_now) and (self._precontact_hold_mj is not None) and surf_hint:
+                p_ref_mj = self._precontact_hold_mj.copy()
+                v_ref_mj = np.zeros(3, dtype=float)
+            elif surface_now and (self._contact_recovery_hold_mj is not None) and surf_hint:
+                p_ref_mj = self._contact_recovery_hold_mj.copy()
+                v_ref_mj = np.zeros(3, dtype=float)
             p_ref_pin = self._pos_mj_to_pin(np.asarray(p_ref_mj, dtype=float))
             v_ref_pin = self._vel_mj_to_pin(np.asarray(v_ref_mj, dtype=float))
 
-            surf_k = bool(surf_hint) or bool(surface_now)
+            # Use one model per MPC tick: free dynamics until surface is latched.
+            surf_k = bool(surface_now)
             dam = self._make_dam(
                 p_ref=p_ref_pin,
                 v_ref=v_ref_pin,
@@ -267,12 +381,18 @@ class ClassicalCrocoddylMPC:
             running.append(crocoddyl.IntegratedActionModelEuler(dam, self.cfg.dt))
 
         pT_mj, vT_mj, surfT = self.traj_fn(t0 + self.cfg.horizon * self.cfg.dt)
+        if (not surface_now) and (self._precontact_hold_mj is not None) and surfT:
+            pT_mj = self._precontact_hold_mj.copy()
+            vT_mj = np.zeros(3, dtype=float)
+        elif surface_now and (self._contact_recovery_hold_mj is not None) and surfT:
+            pT_mj = self._contact_recovery_hold_mj.copy()
+            vT_mj = np.zeros(3, dtype=float)
         pT_pin = self._pos_mj_to_pin(np.asarray(pT_mj, dtype=float))
         vT_pin = self._vel_mj_to_pin(np.asarray(vT_mj, dtype=float))
         terminal_dam = self._make_dam(
             p_ref=pT_pin,
             v_ref=vT_pin,
-            surface_mode=bool(surfT) or bool(surface_now),
+            surface_mode=bool(surface_now),
             terminal=True,
         )
         terminal = crocoddyl.IntegratedActionModelEuler(terminal_dam, self.cfg.dt)
@@ -281,40 +401,7 @@ class ClassicalCrocoddylMPC:
     def _make_dam(self, p_ref: np.ndarray, v_ref: np.ndarray, surface_mode: bool, terminal: bool):
         costs = crocoddyl.CostModelSum(self.state, self.actuation.nu)
 
-        if surface_mode:
-            # Contact mode: tangential tracking + normal depth/velocity shaping.
-            r_xy = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.actuation.nu)
-            act_xy = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 0.0], dtype=float))
-            costs.addCost("ee_xy", crocoddyl.CostModelResidual(self.state, act_xy, r_xy), self.cfg.w_tangent_pos)
-
-            m_ref_xy = pin.Motion(np.array([v_ref[0], v_ref[1], 0.0], dtype=float), np.zeros(3, dtype=float))
-            r_vxy = crocoddyl.ResidualModelFrameVelocity(
-                self.state, self.ee_fid, m_ref_xy, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu
-            )
-            act_vxy = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 0.0, 0.0, 0.0, 0.0], dtype=float))
-            costs.addCost("ee_vxy", crocoddyl.CostModelResidual(self.state, act_vxy, r_vxy), self.cfg.w_tangent_vel)
-
-            z_target = float(self.cfg.z_contact) - float(self.cfg.z_press)
-            p_ref_z = p_ref.copy()
-            p_ref_z[2] = z_target
-            r_z = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref_z, self.actuation.nu)
-            act_z = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 1.0], dtype=float))
-            costs.addCost("z_track", crocoddyl.CostModelResidual(self.state, act_z, r_z), self.cfg.w_plane_z)
-
-            m_vz = pin.Motion(np.zeros(3, dtype=float), np.zeros(3, dtype=float))
-            r_vz = crocoddyl.ResidualModelFrameVelocity(
-                self.state, self.ee_fid, m_vz, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu
-            )
-            act_vz = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=float))
-            costs.addCost("vz_damp", crocoddyl.CostModelResidual(self.state, act_vz, r_vz), self.cfg.w_vz)
-        else:
-            r_pos = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.actuation.nu)
-            act_pos = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 1.5], dtype=float))
-            costs.addCost("ee_pos", crocoddyl.CostModelResidual(self.state, act_pos, r_pos), self.cfg.w_ee_pos)
-
-        r_rot = crocoddyl.ResidualModelFrameRotation(self.state, self.ee_fid, self.R_des, self.actuation.nu)
-        costs.addCost("ee_ori", crocoddyl.CostModelResidual(self.state, r_rot), self.cfg.w_ee_ori)
-
+        # --- common posture + velocity damping (keep your structure) ---
         x_ref = np.concatenate([self.q_nom, np.zeros(self.model.nv)])
         r_x = crocoddyl.ResidualModelState(self.state, x_ref, self.actuation.nu)
         costs.addCost("posture", crocoddyl.CostModelResidual(self.state, r_x), self.cfg.w_posture)
@@ -326,8 +413,301 @@ class ClassicalCrocoddylMPC:
         )
         costs.addCost("v_damp", crocoddyl.CostModelResidual(self.state, act_v, r_v), self.cfg.w_v)
 
+        # --- orientation stabilization: pose + angular velocity damping ---
+        r_rot = crocoddyl.ResidualModelFrameRotation(self.state, self.ee_fid, self.R_des, self.actuation.nu)
+        costs.addCost("ee_ori", crocoddyl.CostModelResidual(self.state, r_rot), self.cfg.w_ee_ori)
+
+        # angular velocity damping (LOCAL_WORLD_ALIGNED; penalize only rotational part)
+        m_w0 = pin.Motion(np.zeros(3), np.zeros(3))
+        r_w = crocoddyl.ResidualModelFrameVelocity(
+            self.state, self.ee_fid, m_w0, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu
+        )
+        act_w = crocoddyl.ActivationModelWeightedQuad(np.array([0, 0, 0, 1, 1, 1], dtype=float))
+        costs.addCost("w_damp", crocoddyl.CostModelResidual(self.state, act_w, r_w), self.cfg.w_wdamp)
+
         if not terminal:
             r_tau = crocoddyl.ResidualModelControl(self.state, self.actuation.nu)
             costs.addCost("tau_reg", crocoddyl.CostModelResidual(self.state, r_tau), self.cfg.w_tau)
 
-        return crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, costs)
+        # ===========================
+        # FREE SPACE (no contact)
+        # ===========================
+        if not surface_mode:
+            r_pos = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.actuation.nu)
+            act_pos = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 1.5], dtype=float))
+            costs.addCost("ee_pos", crocoddyl.CostModelResidual(self.state, act_pos, r_pos), self.cfg.w_ee_pos)
+
+            dam = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, costs)
+            dam.u_lb = -np.asarray(self.cfg.tau_limits, dtype=float)
+            dam.u_ub = np.asarray(self.cfg.tau_limits, dtype=float)
+            return dam
+        # ===========================
+        # CONTACT MODE (paper-faithful)
+        # ===========================
+        contacts = crocoddyl.ContactModelMultiple(self.state, self.actuation.nu)
+
+        # Desired contact point (in WORLD): lock z to the plane while tracking x,y tangentially
+        z_target = float(self.cfg.z_contact) - float(self.cfg.z_press)
+        p_contact = p_ref.copy()
+        p_contact[2] = z_target
+
+        # NOTE: 3D rigid point contact enforces no-slip and therefore blocks tangential motion.
+        # For "draw circle while maintaining table contact", the physically consistent baseline is
+        # normal-only contact (unilateral normal force + tangential tracking costs).
+        contact_mode = str(self.cfg.contact_model).strip().lower()
+        if contact_mode in ("point3d", "3d", "rigid3d", "route_a_3d"):
+            contact_model = self._make_contact_model_3d(p_contact)
+            nc = 3
+        else:
+            contact_model = self._make_contact_model_1d(z_target)
+            nc = 1
+
+        # Add contact (name is for bookkeeping).
+        contacts.addContact(self.cfg.contact_name, contact_model)
+        contact_id = self.ee_fid
+
+        # ----- Tangential tracking costs (x,y) -----
+        r_xy = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.actuation.nu)
+        act_xy = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 0.0], dtype=float))
+        costs.addCost("ee_xy", crocoddyl.CostModelResidual(self.state, act_xy, r_xy), self.cfg.w_tangent_pos)
+
+        # Tangential velocity tracking (x,y)
+        m_ref_xy = pin.Motion(np.array([v_ref[0], v_ref[1], 0.0], dtype=float), np.zeros(3, dtype=float))
+        r_vxy = crocoddyl.ResidualModelFrameVelocity(
+            self.state, self.ee_fid, m_ref_xy, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu
+        )
+        act_vxy = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 0.0, 0.0, 0.0, 0.0], dtype=float))
+        costs.addCost("ee_vxy", crocoddyl.CostModelResidual(self.state, act_vxy, r_vxy), self.cfg.w_tangent_vel)
+
+        # Optional soft vertical shaping around the pressed contact height.
+        if self.cfg.w_plane_z > 0.0:
+            r_z = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_contact, self.actuation.nu)
+            act_z = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 1.0], dtype=float))
+            costs.addCost("plane_z", crocoddyl.CostModelResidual(self.state, act_z, r_z), self.cfg.w_plane_z)
+
+        if self.cfg.w_vz > 0.0:
+            m_vz = pin.Motion(np.zeros(3, dtype=float), np.zeros(3, dtype=float))
+            r_vz = crocoddyl.ResidualModelFrameVelocity(
+                self.state, self.ee_fid, m_vz, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu
+            )
+            act_vz = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 1.0, 0.0, 0.0, 0.0], dtype=float))
+            costs.addCost("vz_damp", crocoddyl.CostModelResidual(self.state, act_vz, r_vz), self.cfg.w_vz)
+
+        # Friction cone + unilateral feasibility (soft constraints via barrier activation).
+        if (nc == 3) and (self.cfg.w_friction_cone > 0.0):
+            cone = self._make_friction_cone()
+            r_fc = self._make_contact_friction_residual(contact_id, cone)
+            act_fc = self._make_friction_barrier_activation(cone)
+            costs.addCost(
+                "friction_cone",
+                crocoddyl.CostModelResidual(self.state, act_fc, r_fc),
+                self.cfg.w_friction_cone,
+            )
+
+        # Explicit unilateral normal-force barrier (Fn >= 0).
+        if self.cfg.w_unilateral > 0.0:
+            r_f0 = self._make_contact_force_residual(contact_id, pin.Force(np.zeros(6, dtype=float)), nc)
+            if nc == 1:
+                lb_uni = np.array([0.0 + float(self.cfg.friction_margin)], dtype=float)
+                ub_uni = np.array([np.inf], dtype=float)
+            else:
+                lb_uni = np.array([-np.inf, -np.inf, 0.0 + float(self.cfg.friction_margin)], dtype=float)
+                ub_uni = np.array([np.inf, np.inf, np.inf], dtype=float)
+            act_uni = crocoddyl.ActivationModelQuadraticBarrier(crocoddyl.ActivationBounds(lb_uni, ub_uni, 1.0))
+            costs.addCost("unilateral", crocoddyl.CostModelResidual(self.state, act_uni, r_f0), self.cfg.w_unilateral)
+
+        # Classical baseline normal-force objective (predicted force, no feedback injection).
+        if self.cfg.w_fn > 0.0:
+            fref = pin.Force(np.array([0.0, 0.0, float(self.cfg.fn_des), 0.0, 0.0, 0.0], dtype=float))
+            r_fn = self._make_contact_force_residual(contact_id, fref, nc)
+            if nc == 1:
+                act_fz = crocoddyl.ActivationModelWeightedQuad(np.array([1.0], dtype=float))
+            else:
+                act_fz = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 1.0], dtype=float))
+            costs.addCost("fn_track", crocoddyl.CostModelResidual(self.state, act_fz, r_fn), self.cfg.w_fn)
+
+        # ----- Contact forward dynamics model -----
+        # NOTE: This signature also varies; keep your current one unless it errors.
+        dam = crocoddyl.DifferentialActionModelContactFwdDynamics(
+            self.state, self.actuation, contacts, costs, 0.0, True
+        )
+        dam.JMinvJt_damping = float(self.cfg.contact_inv_damping)
+        dam.u_lb = -np.asarray(self.cfg.tau_limits, dtype=float)
+        dam.u_ub = np.asarray(self.cfg.tau_limits, dtype=float)
+        return dam
+
+
+
+    
+    def _shift_guess(self, x0: np.ndarray, N: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        """
+        Proper receding-horizon warm start:
+        xs_init = [x0] + xs_prev[1:] (clipped to horizon)
+        us_init = us_prev[1:] + [us_prev[-1]]
+        Falls back to holding x0 / tau_prev if no previous solution.
+        """
+        if self.xs is None or self.us is None or len(self.us) < N:
+            xs_init = [x0.copy() for _ in range(N + 1)]
+            us_init = [self._tau_prev.copy() for _ in range(N)]
+            return xs_init, us_init
+
+        xs_prev = self.xs
+        us_prev = self.us
+
+        xs_init = [x0.copy()]
+        xs_init += [xs_prev[i].copy() for i in range(1, min(len(xs_prev), N + 1))]
+        while len(xs_init) < (N + 1):
+            xs_init.append(xs_prev[-1].copy())
+
+        us_init = [us_prev[i].copy() for i in range(1, min(len(us_prev), N))]
+        while len(us_init) < N:
+            us_init.append(us_prev[-1].copy())
+
+        return xs_init, us_init
+    
+    def _make_contact_friction_residual(self, contact_id: int, cone):
+        try:
+            return crocoddyl.ResidualModelContactFrictionCone(self.state, contact_id, cone, self.actuation.nu, True)
+        except TypeError:
+            try:
+                return crocoddyl.ResidualModelContactFrictionCone(self.state, contact_id, cone, self.actuation.nu)
+            except TypeError:
+                return crocoddyl.ResidualModelContactFrictionCone(self.state, contact_id, cone)
+
+    def _make_contact_force_residual(self, contact_id: int, fref: pin.Force, nc: int):
+        try:
+            return crocoddyl.ResidualModelContactForce(self.state, contact_id, fref, nc, self.actuation.nu, True)
+        except TypeError:
+            try:
+                return crocoddyl.ResidualModelContactForce(self.state, contact_id, fref, nc, self.actuation.nu)
+            except TypeError:
+                return crocoddyl.ResidualModelContactForce(self.state, contact_id, fref, nc)
+
+    def _make_friction_barrier_activation(self, cone):
+        lb = np.asarray(cone.lb, dtype=float).copy()
+        ub = np.asarray(cone.ub, dtype=float).copy()
+
+        eps = max(float(self.cfg.friction_margin), 0.0)
+        if eps > 0.0:
+            finite_lb = np.isfinite(lb)
+            finite_ub = np.isfinite(ub)
+            lb[finite_lb] += eps
+            ub[finite_ub] -= eps
+
+        bounds = crocoddyl.ActivationBounds(lb, ub, 1.0)
+        return crocoddyl.ActivationModelQuadraticBarrier(bounds)
+
+    def _extract_predicted_normal_force(self, problem) -> float:
+        try:
+            if problem is None or len(problem.runningDatas) == 0:
+                return np.nan
+
+            rd0 = problem.runningDatas[0]
+            dd0 = getattr(rd0, "differential", None)
+            if dd0 is None:
+                return np.nan
+
+            mb = getattr(dd0, "multibody", None)
+            if mb is None or not hasattr(mb, "contacts"):
+                return np.nan
+
+            contacts = mb.contacts.contacts
+            contacts_dict = contacts.todict() if hasattr(contacts, "todict") else {}
+            if len(contacts_dict) == 0:
+                return np.nan
+
+            cdata = contacts_dict.get(self.cfg.contact_name, next(iter(contacts_dict.values())))
+            if not hasattr(cdata, "f"):
+                return np.nan
+
+            f_obj = cdata.f
+            if hasattr(f_obj, "linear"):
+                f_lin = np.asarray(f_obj.linear, dtype=float).reshape(-1)
+                if f_lin.size >= 3:
+                    # Contact normal is world +z in LOCAL_WORLD_ALIGNED for the table task.
+                    return float(f_lin[2])
+
+            f_arr = np.asarray(f_obj, dtype=float).reshape(-1)
+            if f_arr.size == 1:
+                return float(f_arr[0])
+            if f_arr.size >= 3:
+                return float(f_arr[2])
+            return np.nan
+        except Exception:
+            return np.nan
+
+    def _make_contact_model_3d(self, p_contact: np.ndarray):
+        gains = np.asarray(self.cfg.contact_gains, dtype=float).reshape(2)
+        try:
+            return crocoddyl.ContactModel3D(
+                self.state, self.ee_fid, p_contact, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu, gains
+            )
+        except TypeError:
+            try:
+                return crocoddyl.ContactModel3D(
+                    self.state, self.ee_fid, p_contact, pin.LOCAL_WORLD_ALIGNED, gains
+                )
+            except TypeError:
+                try:
+                    return crocoddyl.ContactModel3D(
+                        self.state, self.ee_fid, p_contact, pin.LOCAL_WORLD_ALIGNED, self.actuation.nu
+                    )
+                except TypeError:
+                    try:
+                        return crocoddyl.ContactModel3D(
+                            self.state, self.ee_fid, p_contact, pin.LOCAL_WORLD_ALIGNED
+                        )
+                    except TypeError:
+                        return crocoddyl.ContactModel3D(self.state, self.ee_fid, p_contact)
+
+    def _make_contact_model_1d(self, z_target: float):
+        gains = np.asarray(self.cfg.contact_gains, dtype=float).reshape(2)
+        R = np.eye(3)
+        try:
+            return crocoddyl.ContactModel1D(
+                self.state,
+                self.ee_fid,
+                float(z_target),
+                pin.LOCAL_WORLD_ALIGNED,
+                R,
+                self.actuation.nu,
+                gains,
+            )
+        except TypeError:
+            try:
+                return crocoddyl.ContactModel1D(
+                    self.state,
+                    self.ee_fid,
+                    float(z_target),
+                    pin.LOCAL_WORLD_ALIGNED,
+                    self.actuation.nu,
+                    gains,
+                )
+            except TypeError:
+                try:
+                    return crocoddyl.ContactModel1D(
+                        self.state, self.ee_fid, float(z_target), pin.LOCAL_WORLD_ALIGNED, gains
+                    )
+                except TypeError:
+                    return crocoddyl.ContactModel1D(self.state, self.ee_fid, float(z_target), pin.LOCAL_WORLD_ALIGNED)
+
+    def _make_friction_cone(self):
+        R = np.eye(3)
+        mu = float(self.cfg.mu)
+        nf = 4
+        inner = False
+
+        # Try the most common signature first: (R, mu, nf, inner)
+        try:
+            return crocoddyl.FrictionCone(R, mu, nf, inner)
+        except Exception:
+            pass
+
+        # Some builds: (R, mu, nf)
+        try:
+            return crocoddyl.FrictionCone(R, mu, nf)
+        except Exception:
+            pass
+
+        # Some older builds: (mu, nf, inner)
+        return crocoddyl.FrictionCone(mu, nf, inner)
