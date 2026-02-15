@@ -12,7 +12,12 @@ import mujoco
 class Observation:
     q: np.ndarray                 # (7,)
     dq: np.ndarray                # (7,)
-    tau_meas: np.ndarray          # (7,) applied torque in torque mode
+    tau_meas: np.ndarray          # (7,) measured-torque proxy (defaults to tau_total)
+    tau_meas_filt: np.ndarray     # (7,) low-pass filtered measured-torque proxy
+    tau_cmd: np.ndarray           # (7,) qfrc_applied command torque
+    tau_act: np.ndarray           # (7,) MuJoCo actuator torque contribution
+    tau_constraint: np.ndarray    # (7,) MuJoCo constraint/contact torque contribution
+    tau_total: np.ndarray         # (7,) tau_cmd + tau_act + tau_constraint
     tau_bias: np.ndarray          # (7,) mujoco bias torque (gravity+coriolis)
     f_contact_world: np.ndarray   # (3,) total contact force ON ee geom, world
     f_contact_normal: float       # scalar normal magnitude (>=0)
@@ -30,6 +35,9 @@ class FrankaMujocoSim:
 
     torque mode:
       - applies u (7,) directly to qfrc_applied for the 7 arm DoFs
+      - exposes explicit torque channels in Observation:
+          tau_cmd (qfrc_applied), tau_act (qfrc_actuator),
+          tau_constraint (qfrc_constraint), tau_total, tau_meas_filt
       - returns tau_bias so controllers can do gravity compensation
     """
 
@@ -42,6 +50,7 @@ class FrankaMujocoSim:
         ee_collision_geom_name: str = "ee_collision",
         arm_joint_names: Optional[list[str]] = None,
         arm_actuator_names: Optional[list[str]] = None,
+        tau_meas_lpf_alpha: float = 0.2,
     ):
         self.scene_xml = str(scene_xml)
         self.model = mujoco.MjModel.from_xml_path(self.scene_xml)
@@ -51,6 +60,7 @@ class FrankaMujocoSim:
             raise ValueError("command_type must be 'pos' or 'torque'")
         self.command_type = command_type
         self.n_substeps = int(n_substeps)
+        self.tau_meas_lpf_alpha = float(np.clip(tau_meas_lpf_alpha, 0.0, 1.0))
 
         # 7 arm joints
         if arm_joint_names is None:
@@ -84,6 +94,8 @@ class FrankaMujocoSim:
         if self.ee_geom_id < 0:
             raise ValueError(f"Missing geom '{ee_collision_geom_name}'")
 
+        self._tau_meas_filt = np.zeros(7, dtype=np.float64)
+
         # In torque mode we want qfrc_applied to be the only actuation source.
         # Panda's default actuators are position servos with nonzero bias terms;
         # leaving them enabled injects large hidden torques even when ctrl is zero.
@@ -108,6 +120,10 @@ class FrankaMujocoSim:
         self.data.ctrl[:] = 0.0
 
         mujoco.mj_forward(self.model, self.data)
+        tau_cmd = self.data.qfrc_applied[self.dof_adr].copy()
+        tau_act = self.data.qfrc_actuator[self.dof_adr].copy()
+        tau_constraint = self.data.qfrc_constraint[self.dof_adr].copy()
+        self._tau_meas_filt = tau_cmd + tau_act + tau_constraint
         return self.get_observation(with_ee=True, with_jacobian=True)
 
     def step(self, u: np.ndarray) -> Observation:
@@ -146,11 +162,15 @@ class FrankaMujocoSim:
         dq = self.data.qvel[self.dof_adr].copy()
 
         tau_bias = self.data.qfrc_bias[self.dof_adr].copy()
-
-        if self.command_type == "torque":
-            tau_meas = self.data.qfrc_applied[self.dof_adr].copy()
-        else:
-            tau_meas = self.data.qfrc_actuator[self.dof_adr].copy()
+        tau_cmd = self.data.qfrc_applied[self.dof_adr].copy()
+        tau_act = self.data.qfrc_actuator[self.dof_adr].copy()
+        tau_constraint = self.data.qfrc_constraint[self.dof_adr].copy()
+        tau_total = tau_cmd + tau_act + tau_constraint
+        # Measured effort proxy used by higher-level controllers; keep explicit and deterministic.
+        tau_meas = tau_total.copy()
+        a = self.tau_meas_lpf_alpha
+        self._tau_meas_filt = (1.0 - a) * self._tau_meas_filt + a * tau_meas
+        tau_meas_filt = self._tau_meas_filt.copy()
 
         f_world, f_normal = self._ee_contact_force_world()
 
@@ -179,6 +199,11 @@ class FrankaMujocoSim:
             q=q,
             dq=dq,
             tau_meas=tau_meas,
+            tau_meas_filt=tau_meas_filt,
+            tau_cmd=tau_cmd,
+            tau_act=tau_act,
+            tau_constraint=tau_constraint,
+            tau_total=tau_total,
             tau_bias=tau_bias,
             f_contact_world=f_world,
             f_contact_normal=float(f_normal),

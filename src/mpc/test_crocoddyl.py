@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Optional
 
 import mujoco
 import mujoco.viewer
 import numpy as np
+import pinocchio as pin
 
 from src.mpc.crocoddyl_classical import ClassicalCrocoddylMPC, ClassicalMPCConfig
 from src.sim.franka_sim import FrankaMujocoSim
@@ -13,7 +15,7 @@ from src.tasks.trajectories import make_approach_then_circle
 from src.utils.logging import RunLogger
 
 SCENE = Path("assets/scenes/panda_table_scene.xml")
-SCENARIOS = ("flat", "tilted", "actuation_uncertainty")
+SCENARIOS = ("flat", "tilted_5", "tilted_10", "tilted_15", "actuation_uncertainty")
 
 
 def _table_geometry_world(sim: FrankaMujocoSim):
@@ -34,17 +36,36 @@ def _scenario_settings(name: str):
             "torque_scale": np.ones(7, dtype=float),
             "label": "Flat table",
         }
-    if name == "tilted":
+    if name == "tilted_5":
         return {
-            "tilt_deg": 8.0,
+            "tilt_deg": 5.0,
             "torque_scale": np.ones(7, dtype=float),
-            "label": "Tilted table (8deg)",
+            "label": "Tilted table (5deg)",
+        }
+    if name == "tilted_10":
+        return {
+            "tilt_deg": 10.0,
+            "torque_scale": np.ones(7, dtype=float),
+            "label": "Tilted table (10deg)",
+        }
+    if name == "tilted_15":
+        return {
+            "tilt_deg": 15.0,
+            "torque_scale": np.ones(7, dtype=float),
+            "label": "Tilted table (15deg)",
         }
     if name == "actuation_uncertainty":
         return {
             "tilt_deg": 0.0,
             "torque_scale": np.array([0.90, 1.08, 0.92, 1.05, 0.88, 1.10, 0.86], dtype=float),
             "label": "Actuation gain mismatch",
+        }
+    # backward-compat alias
+    if name == "tilted":
+        return {
+            "tilt_deg": 8.0,
+            "torque_scale": np.ones(7, dtype=float),
+            "label": "Tilted table (8deg)",
         }
     raise ValueError(f"Unknown scenario '{name}'")
 
@@ -123,12 +144,85 @@ def _save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     plt.close()
 
 
+def _check_pin_mj_alignment(sim: FrankaMujocoSim, mpc: ClassicalCrocoddylMPC, samples: int = 16, seed: int = 0) -> dict:
+    """
+    Quick consistency test for MuJoCo site pose vs. Pinocchio EE frame mapping.
+    Returns aggregate position/rotation errors in MuJoCo world coordinates.
+    """
+    samples = int(max(samples, 0))
+    if samples == 0:
+        return {"samples": 0, "max_pos_m": np.nan, "rms_pos_m": np.nan, "max_rot_deg": np.nan, "rms_rot_deg": np.nan}
+
+    qpos0 = sim.data.qpos.copy()
+    qvel0 = sim.data.qvel.copy()
+    qacc0 = sim.data.qacc.copy()
+
+    rng = np.random.default_rng(int(seed))
+    q_ref = np.asarray(sim.data.qpos[sim.qpos_adr], dtype=float).copy()
+    jnt_range = np.asarray(sim.model.jnt_range[sim.jnt_ids], dtype=float)
+
+    pos_errs = []
+    rot_errs = []
+
+    try:
+        for _ in range(samples):
+            q = q_ref.copy()
+            for j in range(7):
+                lo, hi = float(jnt_range[j, 0]), float(jnt_range[j, 1])
+                if np.isfinite(lo) and np.isfinite(hi) and (hi > lo):
+                    mid = 0.5 * (lo + hi)
+                    half = 0.4 * (hi - lo)  # stay away from hard limits
+                    q[j] = rng.uniform(mid - half, mid + half)
+                else:
+                    q[j] = q_ref[j] + rng.normal(scale=0.2)
+
+            sim.data.qvel[:] = 0.0
+            for j, adr in enumerate(sim.qpos_adr):
+                sim.data.qpos[adr] = q[j]
+            mujoco.mj_forward(sim.model, sim.data)
+
+            p_mj = sim.data.site_xpos[sim.ee_site_id].copy()
+            R_mj = sim.data.site_xmat[sim.ee_site_id].reshape(3, 3).copy()
+
+            pin.forwardKinematics(mpc.model, mpc.data, q, np.zeros(mpc.model.nv))
+            pin.updateFramePlacements(mpc.model, mpc.data)
+            oMf = mpc.data.oMf[mpc.ee_fid]
+            p_mj_pred = mpc.R_mj_from_pin @ oMf.translation
+            R_mj_pred = mpc.R_mj_from_pin @ oMf.rotation @ mpc.R_site_from_pin_ee
+
+            pos_errs.append(float(np.linalg.norm(p_mj - p_mj_pred)))
+            R_err = R_mj_pred.T @ R_mj
+            c = float(np.clip((np.trace(R_err) - 1.0) * 0.5, -1.0, 1.0))
+            rot_errs.append(float(np.arccos(c)))
+    finally:
+        sim.data.qpos[:] = qpos0
+        sim.data.qvel[:] = qvel0
+        sim.data.qacc[:] = qacc0
+        mujoco.mj_forward(sim.model, sim.data)
+
+    pos_arr = np.asarray(pos_errs, dtype=float)
+    rot_arr = np.asarray(rot_errs, dtype=float)
+    return {
+        "samples": int(samples),
+        "max_pos_m": float(np.max(pos_arr)),
+        "rms_pos_m": float(np.sqrt(np.mean(pos_arr ** 2))),
+        "max_rot_deg": float(np.rad2deg(np.max(rot_arr))),
+        "rms_rot_deg": float(np.rad2deg(np.sqrt(np.mean(rot_arr ** 2)))),
+    }
+
+
 def _run_single(
     scenario: str,
     total_time: float,
     no_viewer: bool,
     results_dir: Path,
     save_plots: bool,
+    contact_model: str,
+    paper_budget: bool,
+    mpc_iters: Optional[int],
+    use_command_filter: bool,
+    contact_stabilization_time: float,
+    align_check_samples: int,
 ) -> dict:
     settings = _scenario_settings(scenario)
 
@@ -145,6 +239,7 @@ def _run_single(
     print(f"Simulation initialized (dt={sim.dt:.4f}s)")
     print(f"Initial EE position: {obs.ee_pos}")
     print(f"Scenario: {settings['label']}")
+    print(f"Contact model: {contact_model} | command_filter={int(use_command_filter)}")
 
     _, table_center, table_half, z_table_top = _table_geometry_world(sim)
     r_tool = float(sim.model.geom_size[sim.ee_geom_id][0])
@@ -170,8 +265,14 @@ def _run_single(
         ee_start=obs.ee_pos.copy(),
         t_pre=2.2,
     )
-    t_contact_phase = 4.2  # must match t_pre + t_approach above
+    t_contact_phase = 4.2 + float(max(contact_stabilization_time, 0.0))
     print("Trajectory generated (approach + circle)")
+
+    max_iters = int(mpc_iters) if mpc_iters is not None else (5 if paper_budget else 55)
+    print(
+        f"MPC budget: max_iters={max_iters} "
+        f"({'paper budget' if paper_budget and mpc_iters is None else 'custom/dev'})"
+    )
 
     cfg = ClassicalMPCConfig(
         horizon=30,
@@ -187,6 +288,8 @@ def _run_single(
         w_tau=1.0e-3,
         torque_ref_mode="gravity_x0",
         w_tau_soft_limits=2.0,
+        w_q_soft_limits=12.0,
+        q_soft_limit_margin=0.08,
         w_tau_smooth=5.0e-2,
         w_tangent_pos=3.1e3,
         w_tangent_vel=1.0e3,
@@ -195,7 +298,6 @@ def _run_single(
         w_friction_cone=0.0,
         w_unilateral=2.0e1,
         mu=1.0,
-        contact_model="normal_1d",
         contact_gains=np.array([82.0, 45.0], dtype=float),
         fn_des=28.5,
         w_fn=2.85e1,
@@ -204,13 +306,16 @@ def _run_single(
         fn_contact_on=1.0,
         fn_contact_off=0.05,
         z_contact_band=0.012,
-        max_iters=55,
+        max_iters=max_iters,
         mpc_update_steps=1,
         use_feedback_policy=True,
         feedback_gain_scale=0.12,
         max_tau_raw_inf=1.5e2,
         contact_release_steps=180,
+        contact_model=contact_model,
+        apply_command_filter=use_command_filter,
         enable_contact_recovery_hold=False,
+        contact_stabilization_time=float(max(contact_stabilization_time, 0.0)),
         strict_force_residual_dim=True,
         debug_every=100,
     )
@@ -218,6 +323,15 @@ def _run_single(
 
     mpc = ClassicalCrocoddylMPC(sim=sim, traj_fn=traj, config=cfg)
     print("MPC initialized")
+    align_stats = _check_pin_mj_alignment(sim, mpc, samples=align_check_samples, seed=0)
+    if align_stats["samples"] > 0:
+        print(
+            "EE alignment check: "
+            f"rms_pos={align_stats['rms_pos_m']*1e3:.2f}mm "
+            f"max_pos={align_stats['max_pos_m']*1e3:.2f}mm | "
+            f"rms_rot={align_stats['rms_rot_deg']:.3f}deg "
+            f"max_rot={align_stats['max_rot_deg']:.3f}deg"
+        )
     print()
 
     if abs(float(settings["tilt_deg"])) > 1e-12:
@@ -288,6 +402,11 @@ def _run_single(
             fn_des=float(cfg.fn_des),
             tau_cmd=np.asarray(tau_cmd, dtype=float).copy(),
             tau_meas=np.asarray(obs_next.tau_meas, dtype=float).copy(),
+            tau_meas_filt=np.asarray(obs_next.tau_meas_filt, dtype=float).copy(),
+            tau_cmd_sim=np.asarray(obs_next.tau_cmd, dtype=float).copy(),
+            tau_act=np.asarray(obs_next.tau_act, dtype=float).copy(),
+            tau_constraint=np.asarray(obs_next.tau_constraint, dtype=float).copy(),
+            tau_total=np.asarray(obs_next.tau_total, dtype=float).copy(),
             tau_applied=np.asarray(tau_applied, dtype=float).copy(),
             contact=int(in_contact),
             surface_ref=int(surf_ref),
@@ -353,6 +472,9 @@ def _run_single(
         dt=float(sim.dt),
         scenario_label=settings["label"],
         scenario_tilt_deg=float(settings["tilt_deg"]),
+        tau_meas_definition="tau_total = tau_cmd + tau_act + tau_constraint",
+        fn_pred_definition="Predicted normal-force variable in the OCP contact model (may not equal physical table-normal force under tilt mismatch).",
+        tau_meas_lpf_alpha=float(sim.tau_meas_lpf_alpha),
         torque_scale=np.asarray(torque_scale, dtype=float),
         fn_des=float(cfg.fn_des),
         rms_tangential_error=rms_tan,
@@ -366,6 +488,7 @@ def _run_single(
         cfg_summary={
             "horizon": int(cfg.horizon),
             "dt": float(cfg.dt),
+            "dt_ocp": float(cfg.dt_ocp if cfg.dt_ocp is not None else cfg.dt),
             "z_contact": float(cfg.z_contact),
             "z_press": float(cfg.z_press),
             "w_fn": float(cfg.w_fn),
@@ -373,7 +496,13 @@ def _run_single(
             "contact_model": str(cfg.contact_model),
             "w_friction_cone": float(cfg.w_friction_cone),
             "w_unilateral": float(cfg.w_unilateral),
+            "w_q_soft_limits": float(cfg.w_q_soft_limits),
+            "q_soft_limit_margin": float(cfg.q_soft_limit_margin),
+            "max_iters": int(cfg.max_iters),
+            "apply_command_filter": bool(cfg.apply_command_filter),
+            "contact_stabilization_time": float(cfg.contact_stabilization_time),
         },
+        frame_alignment=align_stats,
     )
     logger.save()
 
@@ -417,6 +546,12 @@ def main(
     total_time: float,
     results_dir: Path,
     no_plots: bool,
+    contact_model: str,
+    paper_budget: bool,
+    mpc_iters: Optional[int],
+    use_command_filter: bool,
+    contact_stabilization_time: float,
+    align_check_samples: int,
 ):
     if all_scenarios:
         if not no_viewer:
@@ -430,6 +565,12 @@ def main(
                     no_viewer=True,
                     results_dir=results_dir,
                     save_plots=(not no_plots),
+                    contact_model=contact_model,
+                    paper_budget=paper_budget,
+                    mpc_iters=mpc_iters,
+                    use_command_filter=use_command_filter,
+                    contact_stabilization_time=contact_stabilization_time,
+                    align_check_samples=align_check_samples,
                 )
             )
 
@@ -453,17 +594,52 @@ def main(
         no_viewer=no_viewer,
         results_dir=results_dir,
         save_plots=(not no_plots),
+        contact_model=contact_model,
+        paper_budget=paper_budget,
+        mpc_iters=mpc_iters,
+        use_command_filter=use_command_filter,
+        contact_stabilization_time=contact_stabilization_time,
+        align_check_samples=align_check_samples,
     )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", choices=SCENARIOS, default="flat", help="Evaluation scenario.")
-    parser.add_argument("--all-scenarios", action="store_true", help="Run flat/tilted/actuation_uncertainty.")
+    parser.add_argument(
+        "--scenario",
+        choices=SCENARIOS + ("tilted",),
+        default="flat",
+        help="Evaluation scenario.",
+    )
+    parser.add_argument(
+        "--all-scenarios",
+        action="store_true",
+        help="Run flat/tilted_5/tilted_10/tilted_15/actuation_uncertainty.",
+    )
     parser.add_argument("--no-viewer", action="store_true", help="Run without MuJoCo viewer.")
     parser.add_argument("--time", type=float, default=12.0, help="Total simulation time [s].")
     parser.add_argument("--results-dir", type=Path, default=Path("results/classical_eval"), help="Output folder.")
     parser.add_argument("--no-plots", action="store_true", help="Skip plot generation.")
+    parser.add_argument("--contact-model", choices=("normal_1d", "point3d"), default="normal_1d")
+    parser.add_argument("--paper-budget", action="store_true", help="Use paper-like small DDP iteration budget.")
+    parser.add_argument("--mpc-iters", type=int, default=None, help="Override DDP max iterations per MPC solve.")
+    parser.add_argument(
+        "--use-command-filter",
+        action="store_true",
+        help="Enable command smoothing/trust/rate filtering in _safe_tau (off by default for baseline).",
+    )
+    parser.add_argument(
+        "--contact-stabilization-time",
+        type=float,
+        default=0.0,
+        help="Hold XY briefly after contact latch before aggressive tangential tracking [s] (0.0 for strict baseline).",
+    )
+    parser.add_argument(
+        "--align-check-samples",
+        type=int,
+        default=16,
+        help="Number of random q samples for MuJoCo↔Pinocchio EE alignment check (0 disables).",
+    )
     args = parser.parse_args()
 
     main(
@@ -473,4 +649,10 @@ if __name__ == "__main__":
         total_time=args.time,
         results_dir=args.results_dir,
         no_plots=args.no_plots,
+        contact_model=args.contact_model,
+        paper_budget=args.paper_budget,
+        mpc_iters=args.mpc_iters,
+        use_command_filter=args.use_command_filter,
+        contact_stabilization_time=args.contact_stabilization_time,
+        align_check_samples=args.align_check_samples,
     )

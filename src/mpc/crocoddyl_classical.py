@@ -34,6 +34,8 @@ class ClassicalMPCConfig:
     torque_ref_mode: str = "gravity_x0"
     w_tau_soft_limits: float = 2.0
     tau_soft_limit_margin: float = 0.2  # Nm kept away from hard bounds
+    w_q_soft_limits: float = 10.0
+    q_soft_limit_margin: float = 0.05  # rad
 
     # contact phase objectives
     z_contact: float = 0.35
@@ -78,6 +80,7 @@ class ClassicalMPCConfig:
     )  # Nm/s
     tau_trust_inf: float = 40.0
     tau_smoothing_alpha: float = 0.35  # blend factor toward new command
+    apply_command_filter: bool = True
 
     # joint-specific velocity damping weights
     v_damp_weights: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0, 1.0, 0.4, 0.4, 0.4]))
@@ -96,6 +99,7 @@ class ClassicalMPCConfig:
     fallback_dq_damping: float = 5.0
     contact_release_steps: int = 25
     enable_contact_recovery_hold: bool = False
+    contact_stabilization_time: float = 0.0
 
 
 class ClassicalCrocoddylMPC:
@@ -157,10 +161,12 @@ class ClassicalCrocoddylMPC:
         self._surface_latched = False
         self._contact_loss_count = 0
         self._prev_surface_mode: Optional[bool] = None
+        self._contact_latch_time: Optional[float] = None
         # Hold circle start until physical contact is detected.
         self._precontact_hold_mj: Optional[np.ndarray] = None
         # If measured force is temporarily lost in contact phase, freeze XY reference to avoid runaway chasing.
         self._contact_recovery_hold_mj: Optional[np.ndarray] = None
+        self._contact_stabilization_hold_mj: Optional[np.ndarray] = None
         self.last_info = {
             "ok": False,
             "cost": np.nan,
@@ -176,6 +182,11 @@ class ClassicalCrocoddylMPC:
     def _dt_ocp(self) -> float:
         dt_ocp = self.cfg.dt if self.cfg.dt_ocp is None else float(self.cfg.dt_ocp)
         return float(max(dt_ocp, 1.0e-6))
+
+    def _in_contact_stabilization(self, t_query: float) -> bool:
+        if self._contact_latch_time is None:
+            return False
+        return (float(t_query) - float(self._contact_latch_time)) < float(max(self.cfg.contact_stabilization_time, 0.0))
 
     def _make_arm_only_model(self, model_full: pin.Model) -> pin.Model:
         lock_joint_ids = []
@@ -239,6 +250,9 @@ class ClassicalCrocoddylMPC:
             tau_target = self._tau_prev.copy()
 
         tau_target = np.clip(tau_target, -self.cfg.tau_limits, self.cfg.tau_limits)
+        if not bool(self.cfg.apply_command_filter):
+            self._tau_prev = tau_target.copy()
+            return tau_target
 
         # Trust region and slew limit around last command.
         d = tau_target - self._tau_prev
@@ -283,7 +297,9 @@ class ClassicalCrocoddylMPC:
         x0 = np.concatenate([q, v])
 
         p_now, _, surf_hint_now = self.traj_fn(t)
+        prev_surface_mode = bool(self._prev_surface_mode) if self._prev_surface_mode is not None else False
         surface_now = self._detect_surface(obs, t, surf_hint_now)
+        just_latched = bool(surface_now) and (not prev_surface_mode)
         if self._prev_surface_mode is None:
             self._prev_surface_mode = bool(surface_now)
         elif bool(surface_now) != bool(self._prev_surface_mode):
@@ -296,6 +312,10 @@ class ClassicalCrocoddylMPC:
             self._prev_surface_mode = bool(surface_now)
         if surface_now:
             self._precontact_hold_mj = None
+            if just_latched:
+                self._contact_latch_time = float(t)
+                self._contact_stabilization_hold_mj = np.asarray(obs.ee_pos, dtype=float).copy()
+                self._contact_stabilization_hold_mj[2] = float(self.cfg.z_contact) - float(self.cfg.z_press)
             fn_now = float(getattr(obs, "f_contact_normal", 0.0))
             if self.cfg.enable_contact_recovery_hold and surf_hint_now and (fn_now < self.cfg.fn_contact_off):
                 if self._contact_recovery_hold_mj is None:
@@ -308,9 +328,13 @@ class ClassicalCrocoddylMPC:
                 self._precontact_hold_mj = np.asarray(p_now, dtype=float).copy()
                 self._precontact_hold_mj[2] = float(self.cfg.z_contact) - float(self.cfg.z_press)
             self._contact_recovery_hold_mj = None
+            self._contact_stabilization_hold_mj = None
+            self._contact_latch_time = None
         else:
             self._precontact_hold_mj = None
             self._contact_recovery_hold_mj = None
+            self._contact_stabilization_hold_mj = None
+            self._contact_latch_time = None
 
         solve_period = max(1, int(self.cfg.mpc_update_steps))
         need_solve = (
@@ -369,10 +393,7 @@ class ClassicalCrocoddylMPC:
                         self.Ks = [np.asarray(Ki, dtype=float).copy() for Ki in solver.K]
                     else:
                         self.Ks = None
-                    if hasattr(solver, "k"):
-                        self.ks = [np.asarray(ki, dtype=float).copy() for ki in solver.k]
-                    else:
-                        self.ks = None
+                    self.ks = None
 
         tau_raw, policy_idx = self._policy_control(x0)
 
@@ -422,8 +443,7 @@ class ClassicalCrocoddylMPC:
                 self.xs = self.xs[1:] + [self.xs[-1]]
             if (self.Ks is not None) and (len(self.Ks) > 1):
                 self.Ks = self.Ks[1:] + [self.Ks[-1]]
-            if (self.ks is not None) and (len(self.ks) > 1):
-                self.ks = self.ks[1:] + [self.ks[-1]]
+            self.ks = None
 
         return tau_cmd
 
@@ -466,6 +486,40 @@ class ClassicalCrocoddylMPC:
         bounds = crocoddyl.ActivationBounds(lb, ub, 1.0)
         return crocoddyl.ActivationModelQuadraticBarrier(bounds)
 
+    def _make_q_soft_limit_cost(self):
+        q_lb = np.asarray(self.model.lowerPositionLimit, dtype=float).reshape(self.model.nq)
+        q_ub = np.asarray(self.model.upperPositionLimit, dtype=float).reshape(self.model.nq)
+        finite_lb = np.isfinite(q_lb)
+        finite_ub = np.isfinite(q_ub)
+        finite_both = finite_lb & finite_ub
+
+        q_ref = self.q_nom.copy()
+        q_ref[finite_both] = 0.5 * (q_lb[finite_both] + q_ub[finite_both])
+
+        margin = float(max(self.cfg.q_soft_limit_margin, 0.0))
+        q_lb_shrunk = q_lb.copy()
+        q_ub_shrunk = q_ub.copy()
+        q_lb_shrunk[finite_lb] = q_lb[finite_lb] + margin
+        q_ub_shrunk[finite_ub] = q_ub[finite_ub] - margin
+        invalid = finite_both & (q_lb_shrunk > q_ub_shrunk)
+        if np.any(invalid):
+            mid = 0.5 * (q_lb[invalid] + q_ub[invalid])
+            q_lb_shrunk[invalid] = mid - 1.0e-3
+            q_ub_shrunk[invalid] = mid + 1.0e-3
+
+        lb_q_res = np.full(self.model.nq, -np.inf, dtype=float)
+        ub_q_res = np.full(self.model.nq, np.inf, dtype=float)
+        lb_q_res[finite_lb] = q_lb_shrunk[finite_lb] - q_ref[finite_lb]
+        ub_q_res[finite_ub] = q_ub_shrunk[finite_ub] - q_ref[finite_ub]
+
+        lb = np.concatenate([lb_q_res, np.full(self.model.nv, -np.inf, dtype=float)])
+        ub = np.concatenate([ub_q_res, np.full(self.model.nv, np.inf, dtype=float)])
+
+        x_ref = np.concatenate([q_ref, np.zeros(self.model.nv, dtype=float)])
+        residual = crocoddyl.ResidualModelState(self.state, x_ref, self.actuation.nu)
+        activation = crocoddyl.ActivationModelQuadraticBarrier(crocoddyl.ActivationBounds(lb, ub, 1.0))
+        return crocoddyl.CostModelResidual(self.state, activation, residual)
+
     def _build_problem(self, t0: float, x0: np.ndarray, surface_now: bool) -> crocoddyl.ShootingProblem:
         dt_ocp = self._dt_ocp
         tau_ref = self._compute_tau_reference(x0[: self.model.nq])
@@ -473,7 +527,15 @@ class ClassicalCrocoddylMPC:
         for k in range(self.cfg.horizon):
             tk = t0 + k * dt_ocp
             p_ref_mj, v_ref_mj, surf_hint = self.traj_fn(tk)
-            if (not surface_now) and (self._precontact_hold_mj is not None) and surf_hint:
+            if (
+                surface_now
+                and (self._contact_stabilization_hold_mj is not None)
+                and surf_hint
+                and self._in_contact_stabilization(tk)
+            ):
+                p_ref_mj = self._contact_stabilization_hold_mj.copy()
+                v_ref_mj = np.zeros(3, dtype=float)
+            elif (not surface_now) and (self._precontact_hold_mj is not None) and surf_hint:
                 p_ref_mj = self._precontact_hold_mj.copy()
                 v_ref_mj = np.zeros(3, dtype=float)
             elif surface_now and (self._contact_recovery_hold_mj is not None) and surf_hint:
@@ -494,7 +556,15 @@ class ClassicalCrocoddylMPC:
             running.append(crocoddyl.IntegratedActionModelEuler(dam, dt_ocp))
 
         pT_mj, vT_mj, surfT = self.traj_fn(t0 + self.cfg.horizon * dt_ocp)
-        if (not surface_now) and (self._precontact_hold_mj is not None) and surfT:
+        if (
+            surface_now
+            and (self._contact_stabilization_hold_mj is not None)
+            and surfT
+            and self._in_contact_stabilization(t0 + self.cfg.horizon * dt_ocp)
+        ):
+            pT_mj = self._contact_stabilization_hold_mj.copy()
+            vT_mj = np.zeros(3, dtype=float)
+        elif (not surface_now) and (self._precontact_hold_mj is not None) and surfT:
             pT_mj = self._precontact_hold_mj.copy()
             vT_mj = np.zeros(3, dtype=float)
         elif surface_now and (self._contact_recovery_hold_mj is not None) and surfT:
@@ -533,6 +603,9 @@ class ClassicalCrocoddylMPC:
             np.concatenate([np.zeros(self.model.nq), np.asarray(self.cfg.v_damp_weights, dtype=float)])
         )
         costs.addCost("v_damp", crocoddyl.CostModelResidual(self.state, act_v, r_v), self.cfg.w_v)
+
+        if self.cfg.w_q_soft_limits > 0.0:
+            costs.addCost("q_soft_limits", self._make_q_soft_limit_cost(), self.cfg.w_q_soft_limits)
 
         # --- orientation stabilization: pose + angular velocity damping ---
         r_rot = crocoddyl.ResidualModelFrameRotation(self.state, self.ee_fid, self.R_des, self.actuation.nu)
@@ -596,7 +669,8 @@ class ClassicalCrocoddylMPC:
 
         # Add contact (name is for bookkeeping).
         contacts.addContact(self.cfg.contact_name, contact_model)
-        contact_id = self.ee_fid
+        # In Crocoddyl residuals, this id is the contact frame id (not an index in ContactModelMultiple).
+        contact_frame_id = self._contact_frame_id(contact_model)
 
         # ----- Tangential tracking costs (x,y) -----
         r_xy = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.actuation.nu)
@@ -628,7 +702,7 @@ class ClassicalCrocoddylMPC:
         # Friction cone + unilateral feasibility (soft constraints via barrier activation).
         if (nc == 3) and (self.cfg.w_friction_cone > 0.0):
             cone = self._make_friction_cone()
-            r_fc = self._make_contact_friction_residual(contact_id, cone)
+            r_fc = self._make_contact_friction_residual(contact_frame_id, cone)
             act_fc = self._make_friction_barrier_activation(cone)
             costs.addCost(
                 "friction_cone",
@@ -639,9 +713,9 @@ class ClassicalCrocoddylMPC:
         # Explicit unilateral normal-force barrier (Fn >= 0).
         if self.cfg.w_unilateral > 0.0:
             if nc == 1:
-                r_f0 = self._make_contact_force_residual(contact_id, np.array([0.0], dtype=float), nc)
+                r_f0 = self._make_contact_force_residual(contact_frame_id, np.array([0.0], dtype=float), nc)
             else:
-                r_f0 = self._make_contact_force_residual(contact_id, pin.Force(np.zeros(6, dtype=float)), nc)
+                r_f0 = self._make_contact_force_residual(contact_frame_id, pin.Force(np.zeros(6, dtype=float)), nc)
             self._check_force_residual_dimension(r_f0, nc, context="unilateral")
             if nc == 1:
                 lb_uni = np.array([0.0 + float(self.cfg.friction_margin)], dtype=float)
@@ -655,10 +729,12 @@ class ClassicalCrocoddylMPC:
         # Classical baseline normal-force objective (predicted force, no feedback injection).
         if self.cfg.w_fn > 0.0:
             if nc == 1:
-                r_fn = self._make_contact_force_residual(contact_id, np.array([float(self.cfg.fn_des)], dtype=float), nc)
+                r_fn = self._make_contact_force_residual(
+                    contact_frame_id, np.array([float(self.cfg.fn_des)], dtype=float), nc
+                )
             else:
                 fref = pin.Force(np.array([0.0, 0.0, float(self.cfg.fn_des), 0.0, 0.0, 0.0], dtype=float))
-                r_fn = self._make_contact_force_residual(contact_id, fref, nc)
+                r_fn = self._make_contact_force_residual(contact_frame_id, fref, nc)
             self._check_force_residual_dimension(r_fn, nc, context="fn_track")
             if nc == 1:
                 act_fz = crocoddyl.ActivationModelWeightedQuad(np.array([1.0], dtype=float))
@@ -711,9 +787,8 @@ class ClassicalCrocoddylMPC:
 
         i = 0
         u = np.asarray(self.us[i], dtype=float).copy()
-
-        if self.cfg.use_feedback_policy and self.ks is not None and i < len(self.ks):
-            u -= float(self.cfg.feedback_gain_scale) * np.asarray(self.ks[i], dtype=float)
+        # Use the solved nominal control plus local state feedback.
+        # Do not add solver.k here: solver.us is already the optimized nominal sequence.
 
         if (
             self.cfg.use_feedback_policy
@@ -723,11 +798,11 @@ class ClassicalCrocoddylMPC:
             and i < len(self.xs)
         ):
             try:
-                dx = self.state.diff(self.xs[i], x_now)
+                dx = self.state.diff(x_now, self.xs[i])
             except Exception:
                 dx = np.asarray(x_now - self.xs[i], dtype=float)
             K = np.asarray(self.Ks[i], dtype=float)
-            u -= float(self.cfg.feedback_gain_scale) * (K @ dx)
+            u += float(self.cfg.feedback_gain_scale) * (K @ dx)
 
         return u, i
     
@@ -739,6 +814,25 @@ class ClassicalCrocoddylMPC:
                 return crocoddyl.ResidualModelContactFrictionCone(self.state, contact_id, cone, self.actuation.nu)
             except TypeError:
                 return crocoddyl.ResidualModelContactFrictionCone(self.state, contact_id, cone)
+
+    def _contact_frame_id(self, contact_model) -> int:
+        """
+        Return contact frame id used by Crocoddyl contact-force/friction residuals.
+        In current Crocoddyl bindings, these residuals take a frame id.
+        """
+        cid = int(self.ee_fid)
+        if hasattr(contact_model, "id"):
+            try:
+                cid_model = int(contact_model.id)
+                if cid_model != cid:
+                    self._warn_once(
+                        "contact_frame_id_mismatch",
+                        f"Contact model frame id={cid_model} differs from ee_fid={cid}; using model id.",
+                    )
+                cid = cid_model
+            except Exception:
+                pass
+        return cid
 
     def _make_contact_force_residual(self, contact_id: int, fref, nc: int):
         if int(nc) == 1:
