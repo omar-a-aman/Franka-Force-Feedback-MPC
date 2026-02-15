@@ -27,10 +27,6 @@ def _table_geometry_world(sim: FrankaMujocoSim):
     return table_geom_id, table_center, table_size, z_table_top
 
 
-def _clamp(value: float, lo: float, hi: float) -> float:
-    return float(np.minimum(np.maximum(value, lo), hi))
-
-
 def _scenario_settings(name: str):
     if name == "flat":
         return {
@@ -40,7 +36,7 @@ def _scenario_settings(name: str):
         }
     if name == "tilted":
         return {
-            "tilt_deg": -8.0,
+            "tilt_deg": 8.0,
             "torque_scale": np.ones(7, dtype=float),
             "label": "Tilted table (8deg)",
         }
@@ -153,24 +149,16 @@ def _run_single(
     _, table_center, table_half, z_table_top = _table_geometry_world(sim)
     r_tool = float(sim.model.geom_size[sim.ee_geom_id][0])
     z_contact = z_table_top + r_tool + 2.0e-4
-    z_pre = z_contact + 0.06
+    z_pre = z_contact + 0.08
 
-    radius = 0.04
-    omega = 0.3
-    margin = radius + 0.03
-
-    x_min = float(table_center[0] - table_half[0] + margin)
-    x_max = float(table_center[0] + table_half[0] - margin)
-    y_min = float(table_center[1] - table_half[1] + margin)
-    y_max = float(table_center[1] + table_half[1] - margin)
-
-    center_x = _clamp(obs.ee_pos[0], x_min, x_max)
-    center_y = _clamp(obs.ee_pos[1], y_min, y_max)
-    center = np.array([center_x, center_y, z_contact], dtype=float)
+    # Requested benchmark: large-radius circle centered at the table center.
+    radius = 0.10
+    omega = 0.18
+    center = np.array([table_center[0], table_center[1], z_contact], dtype=float)
 
     print(f"Table top (world): center={table_center}, half-size={table_half}, z_top={z_table_top:.4f}m")
     print(f"Contact target: z_contact={z_contact:.4f}m (tool radius={r_tool:.4f}m)")
-    print(f"Circle center (clamped on table): {center}, radius={radius:.3f}m")
+    print(f"Circle center (table center): {center}, radius={radius:.3f}m")
 
     traj = make_approach_then_circle(
         center=center,
@@ -178,18 +166,18 @@ def _run_single(
         omega=omega,
         z_pre=z_pre,
         z_contact=z_contact,
-        t_approach=1.2,
+        t_approach=2.0,
         ee_start=obs.ee_pos.copy(),
-        t_pre=1.2,
+        t_pre=2.2,
     )
-    t_contact_phase = 2.4  # must match t_pre + t_approach above
+    t_contact_phase = 4.2  # must match t_pre + t_approach above
     print("Trajectory generated (approach + circle)")
 
     cfg = ClassicalMPCConfig(
-        horizon=20,
+        horizon=30,
         dt=sim.dt,
         z_contact=z_contact,
-        z_press=0.0030,
+        z_press=0.0085,
         w_ee_pos=8.0e2,
         w_ee_ori=8.0e1,
         ori_weights=np.array([2.5, 2.5, 0.1], dtype=float),
@@ -197,28 +185,28 @@ def _run_single(
         w_v=2.0e-1,
         w_tau=1.0e-3,
         w_tau_smooth=5.0e-2,
-        w_tangent_pos=3.0e3,
-        w_tangent_vel=1.0e3,
-        w_plane_z=6.0e2,
-        w_vz=4.0e2,
+        w_tangent_pos=3.3e3,
+        w_tangent_vel=1.1e3,
+        w_plane_z=1.2e3,
+        w_vz=7.0e2,
         w_friction_cone=0.0,
         w_unilateral=2.0e1,
         mu=1.0,
         contact_model="normal_1d",
-        contact_gains=np.array([40.0, 20.0], dtype=float),
-        fn_des=16.0,
-        w_fn=1.2e1,
+        contact_gains=np.array([75.0, 40.0], dtype=float),
+        fn_des=26.0,
+        w_fn=2.6e1,
         w_wdamp=6.0e1,
         w_wdamp_weights=np.array([1.6, 1.6, 0.2], dtype=float),
         fn_contact_on=1.0,
-        fn_contact_off=0.2,
-        z_contact_band=0.01,
-        max_iters=40,
-        mpc_update_steps=2,
+        fn_contact_off=0.1,
+        z_contact_band=0.012,
+        max_iters=55,
+        mpc_update_steps=1,
         use_feedback_policy=True,
-        feedback_gain_scale=0.35,
+        feedback_gain_scale=0.15,
         max_tau_raw_inf=1.5e2,
-        contact_release_steps=40,
+        contact_release_steps=120,
         debug_every=100,
     )
     print("MPC config created")
