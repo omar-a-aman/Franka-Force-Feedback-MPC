@@ -18,7 +18,7 @@ class ClassicalMPCConfig:
     # free-space tracking (approach phase)
     w_ee_pos: float = 2.0e2
     w_ee_ori: float = 1.0e1
-    # Orientation residual weights [roll, pitch, yaw]. Keep yaw lighter for sanding.
+    # Weights on rotation-log error components (not Euler roll/pitch/yaw).
     ori_weights: np.ndarray = field(default_factory=lambda: np.array([2.0, 2.0, 0.15], dtype=float))
 
     # regularization
@@ -398,6 +398,17 @@ class ClassicalCrocoddylMPC:
                 f"solve={int(solved_now)} i={int(policy_idx)} unstable={int(unstable)}"
             )
 
+        # Receding-horizon rollout: shift stored policy between MPC solves.
+        if (not solved_now) and (self.us is not None) and (self.xs is not None):
+            if len(self.us) > 1:
+                self.us = self.us[1:] + [self.us[-1]]
+            if len(self.xs) > 1:
+                self.xs = self.xs[1:] + [self.xs[-1]]
+            if (self.Ks is not None) and (len(self.Ks) > 1):
+                self.Ks = self.Ks[1:] + [self.Ks[-1]]
+            if (self.ks is not None) and (len(self.ks) > 1):
+                self.ks = self.ks[1:] + [self.ks[-1]]
+
         return tau_cmd
 
     def _make_solver(self, problem: crocoddyl.ShootingProblem):
@@ -620,8 +631,11 @@ class ClassicalCrocoddylMPC:
         if self.us is None or len(self.us) == 0:
             return self._tau_prev.copy(), -1
 
-        i = int(np.clip(self._k - self._last_solve_step, 0, len(self.us) - 1))
+        i = 0
         u = np.asarray(self.us[i], dtype=float).copy()
+
+        if self.cfg.use_feedback_policy and self.ks is not None and i < len(self.ks):
+            u -= float(self.cfg.feedback_gain_scale) * np.asarray(self.ks[i], dtype=float)
 
         if (
             self.cfg.use_feedback_policy

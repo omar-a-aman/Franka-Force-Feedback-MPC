@@ -153,7 +153,7 @@ def _run_single(
 
     # Requested benchmark: large-radius circle centered at the table center.
     radius = 0.10
-    omega = 0.18
+    omega = 0.14
     center = np.array([table_center[0], table_center[1], z_contact], dtype=float)
 
     print(f"Table top (world): center={table_center}, half-size={table_half}, z_top={z_table_top:.4f}m")
@@ -177,7 +177,7 @@ def _run_single(
         horizon=30,
         dt=sim.dt,
         z_contact=z_contact,
-        z_press=0.0085,
+        z_press=0.0095,
         w_ee_pos=8.0e2,
         w_ee_ori=8.0e1,
         ori_weights=np.array([2.5, 2.5, 0.1], dtype=float),
@@ -185,28 +185,28 @@ def _run_single(
         w_v=2.0e-1,
         w_tau=1.0e-3,
         w_tau_smooth=5.0e-2,
-        w_tangent_pos=3.3e3,
-        w_tangent_vel=1.1e3,
-        w_plane_z=1.2e3,
-        w_vz=7.0e2,
+        w_tangent_pos=3.1e3,
+        w_tangent_vel=1.0e3,
+        w_plane_z=1.3e3,
+        w_vz=8.0e2,
         w_friction_cone=0.0,
         w_unilateral=2.0e1,
         mu=1.0,
         contact_model="normal_1d",
-        contact_gains=np.array([75.0, 40.0], dtype=float),
-        fn_des=26.0,
-        w_fn=2.6e1,
+        contact_gains=np.array([82.0, 45.0], dtype=float),
+        fn_des=28.5,
+        w_fn=2.85e1,
         w_wdamp=6.0e1,
         w_wdamp_weights=np.array([1.6, 1.6, 0.2], dtype=float),
         fn_contact_on=1.0,
-        fn_contact_off=0.1,
+        fn_contact_off=0.05,
         z_contact_band=0.012,
         max_iters=55,
         mpc_update_steps=1,
         use_feedback_policy=True,
-        feedback_gain_scale=0.15,
+        feedback_gain_scale=0.12,
         max_tau_raw_inf=1.5e2,
-        contact_release_steps=120,
+        contact_release_steps=180,
         debug_every=100,
     )
     print("MPC config created")
