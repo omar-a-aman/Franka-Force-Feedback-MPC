@@ -176,6 +176,7 @@ def _run_single(
     cfg = ClassicalMPCConfig(
         horizon=30,
         dt=sim.dt,
+        dt_ocp=sim.dt,
         z_contact=z_contact,
         z_press=0.0095,
         w_ee_pos=8.0e2,
@@ -184,6 +185,8 @@ def _run_single(
         w_posture=2.0e-1,
         w_v=2.0e-1,
         w_tau=1.0e-3,
+        torque_ref_mode="gravity_x0",
+        w_tau_soft_limits=2.0,
         w_tau_smooth=5.0e-2,
         w_tangent_pos=3.1e3,
         w_tangent_vel=1.0e3,
@@ -207,6 +210,8 @@ def _run_single(
         feedback_gain_scale=0.12,
         max_tau_raw_inf=1.5e2,
         contact_release_steps=180,
+        enable_contact_recovery_hold=False,
+        strict_force_residual_dim=True,
         debug_every=100,
     )
     print("MPC config created")
