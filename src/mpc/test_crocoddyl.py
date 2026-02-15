@@ -221,7 +221,6 @@ def _run_single(
     paper_budget: bool,
     mpc_iters: Optional[int],
     use_command_filter: bool,
-    contact_stabilization_time: float,
     align_check_samples: int,
 ) -> dict:
     settings = _scenario_settings(scenario)
@@ -265,7 +264,7 @@ def _run_single(
         ee_start=obs.ee_pos.copy(),
         t_pre=2.2,
     )
-    t_contact_phase = 4.2 + float(max(contact_stabilization_time, 0.0))
+    t_contact_phase = 4.2
     print("Trajectory generated (approach + circle)")
 
     max_iters = int(mpc_iters) if mpc_iters is not None else (5 if paper_budget else 55)
@@ -293,8 +292,8 @@ def _run_single(
         w_tau_smooth=5.0e-2,
         w_tangent_pos=3.1e3,
         w_tangent_vel=1.0e3,
-        w_plane_z=1.3e3,
-        w_vz=8.0e2,
+        w_plane_z=0.0,
+        w_vz=0.0,
         w_friction_cone=0.0,
         w_unilateral=2.0e1,
         mu=1.0,
@@ -313,9 +312,8 @@ def _run_single(
         max_tau_raw_inf=1.5e2,
         contact_release_steps=180,
         contact_model=contact_model,
+        phase_source="trajectory",
         apply_command_filter=use_command_filter,
-        enable_contact_recovery_hold=False,
-        contact_stabilization_time=float(max(contact_stabilization_time, 0.0)),
         strict_force_residual_dim=True,
         debug_every=100,
     )
@@ -499,8 +497,8 @@ def _run_single(
             "w_q_soft_limits": float(cfg.w_q_soft_limits),
             "q_soft_limit_margin": float(cfg.q_soft_limit_margin),
             "max_iters": int(cfg.max_iters),
+            "phase_source": str(cfg.phase_source),
             "apply_command_filter": bool(cfg.apply_command_filter),
-            "contact_stabilization_time": float(cfg.contact_stabilization_time),
         },
         frame_alignment=align_stats,
     )
@@ -550,7 +548,6 @@ def main(
     paper_budget: bool,
     mpc_iters: Optional[int],
     use_command_filter: bool,
-    contact_stabilization_time: float,
     align_check_samples: int,
 ):
     if all_scenarios:
@@ -569,7 +566,6 @@ def main(
                     paper_budget=paper_budget,
                     mpc_iters=mpc_iters,
                     use_command_filter=use_command_filter,
-                    contact_stabilization_time=contact_stabilization_time,
                     align_check_samples=align_check_samples,
                 )
             )
@@ -598,7 +594,6 @@ def main(
         paper_budget=paper_budget,
         mpc_iters=mpc_iters,
         use_command_filter=use_command_filter,
-        contact_stabilization_time=contact_stabilization_time,
         align_check_samples=align_check_samples,
     )
 
@@ -629,12 +624,6 @@ if __name__ == "__main__":
         help="Enable command smoothing/trust/rate filtering in _safe_tau (off by default for baseline).",
     )
     parser.add_argument(
-        "--contact-stabilization-time",
-        type=float,
-        default=0.0,
-        help="Hold XY briefly after contact latch before aggressive tangential tracking [s] (0.0 for strict baseline).",
-    )
-    parser.add_argument(
         "--align-check-samples",
         type=int,
         default=16,
@@ -653,6 +642,5 @@ if __name__ == "__main__":
         paper_budget=args.paper_budget,
         mpc_iters=args.mpc_iters,
         use_command_filter=args.use_command_filter,
-        contact_stabilization_time=args.contact_stabilization_time,
         align_check_samples=args.align_check_samples,
     )

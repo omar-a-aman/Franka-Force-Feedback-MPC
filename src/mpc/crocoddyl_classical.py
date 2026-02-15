@@ -40,8 +40,10 @@ class ClassicalMPCConfig:
     # contact phase objectives
     z_contact: float = 0.35
     z_press: float = 0.0020
-    w_plane_z: float = 6.0e3
-    w_vz: float = 6.0e2
+    # Keep these at zero for paper-faithful classical baseline; the normal behavior
+    # should come from contact dynamics + normal-force objective, not extra z shaping.
+    w_plane_z: float = 0.0
+    w_vz: float = 0.0
     w_tangent_pos: float = 2.0e2
     w_tangent_vel: float = 1.0e2
 
@@ -69,6 +71,10 @@ class ClassicalMPCConfig:
 
 
     # surface detection
+    # phase_source:
+    # - "trajectory": use traj_fn surf_hint only (paper-faithful baseline)
+    # - "force_latch": use measured-force latch logic (engineering helper)
+    phase_source: str = "trajectory"
     fn_contact_on: float = 2.0
     fn_contact_off: float = 0.5
     z_contact_band: float = 0.01
@@ -80,7 +86,7 @@ class ClassicalMPCConfig:
     )  # Nm/s
     tau_trust_inf: float = 40.0
     tau_smoothing_alpha: float = 0.35  # blend factor toward new command
-    apply_command_filter: bool = True
+    apply_command_filter: bool = False
 
     # joint-specific velocity damping weights
     v_damp_weights: np.ndarray = field(default_factory=lambda: np.array([1.0, 1.0, 1.0, 1.0, 0.4, 0.4, 0.4]))
@@ -98,8 +104,6 @@ class ClassicalMPCConfig:
     max_tau_raw_inf: float = 3.0e2
     fallback_dq_damping: float = 5.0
     contact_release_steps: int = 25
-    enable_contact_recovery_hold: bool = False
-    contact_stabilization_time: float = 0.0
 
 
 class ClassicalCrocoddylMPC:
@@ -161,12 +165,6 @@ class ClassicalCrocoddylMPC:
         self._surface_latched = False
         self._contact_loss_count = 0
         self._prev_surface_mode: Optional[bool] = None
-        self._contact_latch_time: Optional[float] = None
-        # Hold circle start until physical contact is detected.
-        self._precontact_hold_mj: Optional[np.ndarray] = None
-        # If measured force is temporarily lost in contact phase, freeze XY reference to avoid runaway chasing.
-        self._contact_recovery_hold_mj: Optional[np.ndarray] = None
-        self._contact_stabilization_hold_mj: Optional[np.ndarray] = None
         self.last_info = {
             "ok": False,
             "cost": np.nan,
@@ -182,11 +180,6 @@ class ClassicalCrocoddylMPC:
     def _dt_ocp(self) -> float:
         dt_ocp = self.cfg.dt if self.cfg.dt_ocp is None else float(self.cfg.dt_ocp)
         return float(max(dt_ocp, 1.0e-6))
-
-    def _in_contact_stabilization(self, t_query: float) -> bool:
-        if self._contact_latch_time is None:
-            return False
-        return (float(t_query) - float(self._contact_latch_time)) < float(max(self.cfg.contact_stabilization_time, 0.0))
 
     def _make_arm_only_model(self, model_full: pin.Model) -> pin.Model:
         lock_joint_ids = []
@@ -296,10 +289,14 @@ class ClassicalCrocoddylMPC:
         v = np.asarray(obs.dq, dtype=float)
         x0 = np.concatenate([q, v])
 
-        p_now, _, surf_hint_now = self.traj_fn(t)
-        prev_surface_mode = bool(self._prev_surface_mode) if self._prev_surface_mode is not None else False
-        surface_now = self._detect_surface(obs, t, surf_hint_now)
-        just_latched = bool(surface_now) and (not prev_surface_mode)
+        _, _, surf_hint_now = self.traj_fn(t)
+        phase_mode = str(self.cfg.phase_source).strip().lower()
+        if phase_mode == "force_latch":
+            surface_now = self._detect_surface(obs, t, surf_hint_now)
+        else:
+            # Paper-faithful baseline: phase comes from task schedule, not measured force.
+            surface_now = bool(surf_hint_now)
+
         if self._prev_surface_mode is None:
             self._prev_surface_mode = bool(surface_now)
         elif bool(surface_now) != bool(self._prev_surface_mode):
@@ -310,31 +307,6 @@ class ClassicalCrocoddylMPC:
             self.ks = None
             self._last_solve_step = -1_000_000_000
             self._prev_surface_mode = bool(surface_now)
-        if surface_now:
-            self._precontact_hold_mj = None
-            if just_latched:
-                self._contact_latch_time = float(t)
-                self._contact_stabilization_hold_mj = np.asarray(obs.ee_pos, dtype=float).copy()
-                self._contact_stabilization_hold_mj[2] = float(self.cfg.z_contact) - float(self.cfg.z_press)
-            fn_now = float(getattr(obs, "f_contact_normal", 0.0))
-            if self.cfg.enable_contact_recovery_hold and surf_hint_now and (fn_now < self.cfg.fn_contact_off):
-                if self._contact_recovery_hold_mj is None:
-                    self._contact_recovery_hold_mj = np.asarray(obs.ee_pos, dtype=float).copy()
-                    self._contact_recovery_hold_mj[2] = float(self.cfg.z_contact) - float(self.cfg.z_press)
-            else:
-                self._contact_recovery_hold_mj = None
-        elif surf_hint_now:
-            if self._precontact_hold_mj is None:
-                self._precontact_hold_mj = np.asarray(p_now, dtype=float).copy()
-                self._precontact_hold_mj[2] = float(self.cfg.z_contact) - float(self.cfg.z_press)
-            self._contact_recovery_hold_mj = None
-            self._contact_stabilization_hold_mj = None
-            self._contact_latch_time = None
-        else:
-            self._precontact_hold_mj = None
-            self._contact_recovery_hold_mj = None
-            self._contact_stabilization_hold_mj = None
-            self._contact_latch_time = None
 
         solve_period = max(1, int(self.cfg.mpc_update_steps))
         need_solve = (
@@ -526,21 +498,7 @@ class ClassicalCrocoddylMPC:
         running = []
         for k in range(self.cfg.horizon):
             tk = t0 + k * dt_ocp
-            p_ref_mj, v_ref_mj, surf_hint = self.traj_fn(tk)
-            if (
-                surface_now
-                and (self._contact_stabilization_hold_mj is not None)
-                and surf_hint
-                and self._in_contact_stabilization(tk)
-            ):
-                p_ref_mj = self._contact_stabilization_hold_mj.copy()
-                v_ref_mj = np.zeros(3, dtype=float)
-            elif (not surface_now) and (self._precontact_hold_mj is not None) and surf_hint:
-                p_ref_mj = self._precontact_hold_mj.copy()
-                v_ref_mj = np.zeros(3, dtype=float)
-            elif surface_now and (self._contact_recovery_hold_mj is not None) and surf_hint:
-                p_ref_mj = self._contact_recovery_hold_mj.copy()
-                v_ref_mj = np.zeros(3, dtype=float)
+            p_ref_mj, v_ref_mj, _ = self.traj_fn(tk)
             p_ref_pin = self._pos_mj_to_pin(np.asarray(p_ref_mj, dtype=float))
             v_ref_pin = self._vel_mj_to_pin(np.asarray(v_ref_mj, dtype=float))
 
@@ -555,21 +513,7 @@ class ClassicalCrocoddylMPC:
             )
             running.append(crocoddyl.IntegratedActionModelEuler(dam, dt_ocp))
 
-        pT_mj, vT_mj, surfT = self.traj_fn(t0 + self.cfg.horizon * dt_ocp)
-        if (
-            surface_now
-            and (self._contact_stabilization_hold_mj is not None)
-            and surfT
-            and self._in_contact_stabilization(t0 + self.cfg.horizon * dt_ocp)
-        ):
-            pT_mj = self._contact_stabilization_hold_mj.copy()
-            vT_mj = np.zeros(3, dtype=float)
-        elif (not surface_now) and (self._precontact_hold_mj is not None) and surfT:
-            pT_mj = self._precontact_hold_mj.copy()
-            vT_mj = np.zeros(3, dtype=float)
-        elif surface_now and (self._contact_recovery_hold_mj is not None) and surfT:
-            pT_mj = self._contact_recovery_hold_mj.copy()
-            vT_mj = np.zeros(3, dtype=float)
+        pT_mj, vT_mj, _ = self.traj_fn(t0 + self.cfg.horizon * dt_ocp)
         pT_pin = self._pos_mj_to_pin(np.asarray(pT_mj, dtype=float))
         vT_pin = self._vel_mj_to_pin(np.asarray(vT_mj, dtype=float))
         terminal_dam = self._make_dam(
