@@ -40,7 +40,7 @@ def _scenario_settings(name: str):
         }
     if name == "tilted":
         return {
-            "tilt_deg": 8.0,
+            "tilt_deg": -8.0,
             "torque_scale": np.ones(7, dtype=float),
             "label": "Tilted table (8deg)",
         }
@@ -142,8 +142,8 @@ def _run_single(
 
     sim = FrankaMujocoSim(SCENE, command_type="torque", n_substeps=5)
     obs = sim.reset("neutral")
-
-    _apply_table_tilt(sim, settings["tilt_deg"])
+    # Build the controller references from the nominal flat geometry first.
+    # For disturbed scenarios, the world is tilted afterwards (unknown to the controller model).
     obs = sim.get_observation(with_ee=True, with_jacobian=True)
 
     print(f"Simulation initialized (dt={sim.dt:.4f}s)")
@@ -214,6 +214,9 @@ def _run_single(
         fn_contact_off=0.2,
         z_contact_band=0.01,
         max_iters=40,
+        mpc_update_steps=2,
+        use_feedback_policy=True,
+        feedback_gain_scale=0.35,
         max_tau_raw_inf=1.5e2,
         contact_release_steps=40,
         debug_every=100,
@@ -223,6 +226,14 @@ def _run_single(
     mpc = ClassicalCrocoddylMPC(sim=sim, traj_fn=traj, config=cfg)
     print("MPC initialized")
     print()
+
+    if abs(float(settings["tilt_deg"])) > 1e-12:
+        _apply_table_tilt(sim, settings["tilt_deg"])
+        obs = sim.get_observation(with_ee=True, with_jacobian=True)
+        print(
+            f"Applied hidden table tilt: {settings['tilt_deg']:.1f} deg "
+            "(controller references remain from nominal flat table)."
+        )
 
     logger = RunLogger(
         run_name=f"classical_{scenario}",
@@ -291,6 +302,8 @@ def _run_single(
             solver_cost=float(info.get("cost", np.nan)),
             solver_success=int(bool(info.get("ok", False))),
             solver_unstable=int(bool(info.get("unstable", False))),
+            solver_solved_now=int(bool(info.get("solved_now", False))),
+            solver_policy_idx=int(info.get("policy_idx", -1)),
             tau_raw_inf=float(info.get("tau_raw_inf", np.nan)),
             tau_cmd_inf=float(info.get("tau_cmd_inf", np.nan)),
         )

@@ -76,6 +76,9 @@ class ClassicalMPCConfig:
     # solver
     max_iters: int = 20
     use_box_fddp: bool = True
+    mpc_update_steps: int = 1  # solve OCP every N control steps (>=1)
+    use_feedback_policy: bool = True  # apply u = u_ff + K * dx between MPC solves
+    feedback_gain_scale: float = 0.2
     verbose: bool = False
     debug_every: int = 25
     # numerical safety guard for solver blow-ups
@@ -131,7 +134,13 @@ class ClassicalCrocoddylMPC:
 
         self.xs: Optional[List[np.ndarray]] = None
         self.us: Optional[List[np.ndarray]] = None
+        self.Ks: Optional[List[np.ndarray]] = None
+        self.ks: Optional[List[np.ndarray]] = None
         self._tau_prev = np.asarray(obs0.tau_bias, dtype=float).copy()
+        self._last_solve_step = -1_000_000_000
+        self._last_solve_ok = False
+        self._last_solve_cost = np.nan
+        self._last_solve_iters = -1
 
         # Surface mode latch (hysteresis).
         self._surface_latched = False
@@ -265,6 +274,9 @@ class ClassicalCrocoddylMPC:
             # Mode switches invalidate the shifted warm start.
             self.xs = None
             self.us = None
+            self.Ks = None
+            self.ks = None
+            self._last_solve_step = -1_000_000_000
             self._prev_surface_mode = bool(surface_now)
         if surface_now:
             self._precontact_hold_mj = None
@@ -284,54 +296,84 @@ class ClassicalCrocoddylMPC:
             self._precontact_hold_mj = None
             self._contact_recovery_hold_mj = None
 
-        # Build (or rebuild) the shooting problem for this tick
-        problem = self._build_problem(t0=t, x0=x0, surface_now=surface_now)
+        solve_period = max(1, int(self.cfg.mpc_update_steps))
+        need_solve = (
+            (self.us is None)
+            or (self.xs is None)
+            or ((self._k - self._last_solve_step) >= solve_period)
+        )
 
-        # (Recommended) reuse solver object if possible
-        # Reuse solver if the Python API supports updating the problem; otherwise recreate it.
-        if not hasattr(self, "_solver") or self._solver is None:
-            self._solver = self._make_solver(problem)
-            if self.cfg.verbose:
-                self._solver.setCallbacks([crocoddyl.CallbackVerbose()])
-        else:
-            if hasattr(self._solver, "setProblem"):
-                self._solver.setProblem(problem)
-            else:
-                # Older Crocoddyl python bindings: no setProblem() -> rebuild solver each tick
+        solved_now = False
+        ok = self._last_solve_ok
+        cost = float(self._last_solve_cost)
+        iters = int(self._last_solve_iters)
+        fn_pred = float(self.last_info.get("fn_pred", np.nan))
+
+        if need_solve:
+            # Build (or rebuild) the shooting problem for this MPC update.
+            problem = self._build_problem(t0=t, x0=x0, surface_now=surface_now)
+
+            # (Recommended) reuse solver object if possible
+            # Reuse solver if the Python API supports updating the problem; otherwise recreate it.
+            if not hasattr(self, "_solver") or self._solver is None:
                 self._solver = self._make_solver(problem)
                 if self.cfg.verbose:
                     self._solver.setCallbacks([crocoddyl.CallbackVerbose()])
+            else:
+                if hasattr(self._solver, "setProblem"):
+                    self._solver.setProblem(problem)
+                else:
+                    # Older Crocoddyl python bindings: no setProblem() -> rebuild solver each tick
+                    self._solver = self._make_solver(problem)
+                    if self.cfg.verbose:
+                        self._solver.setCallbacks([crocoddyl.CallbackVerbose()])
 
-        solver = self._solver
+            solver = self._solver
+            N = self.cfg.horizon
+            xs_init, us_init = self._shift_guess(x0, N)
 
-        N = self.cfg.horizon
+            ok = solver.solve(xs_init, us_init, self.cfg.max_iters, False)
+            cost = float(getattr(solver, "cost", np.nan))
+            iters = int(getattr(solver, "iter", -1))
+            fn_pred = self._extract_predicted_normal_force(problem) if surface_now else np.nan
+            solved_now = True
 
-        # Proper shifted warm start
-        xs_init, us_init = self._shift_guess(x0, N)
+            self._last_solve_step = self._k
+            self._last_solve_ok = bool(ok)
+            self._last_solve_cost = float(cost)
+            self._last_solve_iters = int(iters)
 
-        ok = solver.solve(xs_init, us_init, self.cfg.max_iters, False)
-        fn_pred = self._extract_predicted_normal_force(problem) if surface_now else np.nan
+            # Store policy around the nominal trajectory for high-rate execution between MPC solves.
+            if len(solver.us) > 0:
+                u0 = np.asarray(solver.us[0], dtype=float).copy()
+                if np.all(np.isfinite(u0)):
+                    self.xs = [np.asarray(xi, dtype=float).copy() for xi in solver.xs]
+                    self.us = [np.asarray(ui, dtype=float).copy() for ui in solver.us]
+                    if hasattr(solver, "K"):
+                        self.Ks = [np.asarray(Ki, dtype=float).copy() for Ki in solver.K]
+                    else:
+                        self.Ks = None
+                    if hasattr(solver, "k"):
+                        self.ks = [np.asarray(ki, dtype=float).copy() for ki in solver.k]
+                    else:
+                        self.ks = None
 
-        tau_raw = self._tau_prev.copy()
-        cost = float(getattr(solver, "cost", np.nan))
-        if len(solver.us) > 0:
-            u0 = np.asarray(solver.us[0], dtype=float).copy()
-            if np.all(np.isfinite(u0)):
-                tau_raw = u0
-                # store full solution for next warm start
-                self.xs = [np.asarray(xi, dtype=float).copy() for xi in solver.xs]
-                self.us = [np.asarray(ui, dtype=float).copy() for ui in solver.us]
+        tau_raw, policy_idx = self._policy_control(x0)
 
         # Hard safety fallback if solver diverges numerically.
         tau_raw_inf = float(np.max(np.abs(tau_raw)))
-        unstable = (not np.isfinite(cost)) or (cost > float(self.cfg.max_solver_cost)) or (tau_raw_inf > float(self.cfg.max_tau_raw_inf))
+        unstable = (not np.isfinite(cost)) or (cost > float(self.cfg.max_solver_cost)) or (
+            tau_raw_inf > float(self.cfg.max_tau_raw_inf)
+        )
         if unstable:
             tau_raw = np.asarray(obs.tau_bias, dtype=float) - float(self.cfg.fallback_dq_damping) * v
             self.xs = None
             self.us = None
+            self.Ks = None
+            self.ks = None
+            self._last_solve_step = -1_000_000_000
 
         tau_cmd = self._safe_tau(tau_raw)
-        iters = int(getattr(solver, "iter", -1))
         tau_cmd_inf = float(np.max(np.abs(tau_cmd)))
         self.last_info = {
             "ok": bool(ok),
@@ -342,6 +384,8 @@ class ClassicalCrocoddylMPC:
             "surface_mode": bool(surface_now),
             "unstable": bool(unstable),
             "fn_pred": float(fn_pred) if np.isfinite(fn_pred) else np.nan,
+            "solved_now": bool(solved_now),
+            "policy_idx": int(policy_idx),
         }
 
         if (self._k % self.cfg.debug_every) == 0:
@@ -350,7 +394,8 @@ class ClassicalCrocoddylMPC:
             print(
                 f"[MPC] t={t:6.3f} ok={ok} cost={cost:.2e} iters={iters:2d} "
                 f"|tau_raw|∞={np.max(np.abs(tau_raw)):.2f} |tau_cmd|∞={np.max(np.abs(tau_cmd)):.2f} "
-                f"surf={int(surface_now)} fn={fn:.2f} fn_pred={fn_pred:.2f} ee_z={ee_z:.4f} unstable={int(unstable)}"
+                f"surf={int(surface_now)} fn={fn:.2f} fn_pred={fn_pred:.2f} ee_z={ee_z:.4f} "
+                f"solve={int(solved_now)} i={int(policy_idx)} unstable={int(unstable)}"
             )
 
         return tau_cmd
@@ -570,6 +615,29 @@ class ClassicalCrocoddylMPC:
             us_init.append(us_prev[-1].copy())
 
         return xs_init, us_init
+
+    def _policy_control(self, x_now: np.ndarray) -> tuple[np.ndarray, int]:
+        if self.us is None or len(self.us) == 0:
+            return self._tau_prev.copy(), -1
+
+        i = int(np.clip(self._k - self._last_solve_step, 0, len(self.us) - 1))
+        u = np.asarray(self.us[i], dtype=float).copy()
+
+        if (
+            self.cfg.use_feedback_policy
+            and self.Ks is not None
+            and self.xs is not None
+            and i < len(self.Ks)
+            and i < len(self.xs)
+        ):
+            try:
+                dx = self.state.diff(self.xs[i], x_now)
+            except Exception:
+                dx = np.asarray(x_now - self.xs[i], dtype=float)
+            K = np.asarray(self.Ks[i], dtype=float)
+            u -= float(self.cfg.feedback_gain_scale) * (K @ dx)
+
+        return u, i
     
     def _make_contact_friction_residual(self, contact_id: int, cone):
         try:
