@@ -14,6 +14,7 @@ from src.run.paper_uncertainty import PaperUncertaintyInjector, config_for_scena
 from src.sim.franka_sim import FrankaMujocoSim
 from src.tasks.trajectories import make_approach_then_circle
 from src.utils.logging import RunLogger
+from src.utils.paper_plots import save_paper_plots
 
 SCENE = Path("assets/scenes/panda_table_scene.xml")
 SCENARIOS = ("flat", "tilted_5", "tilted_10", "tilted_15", "actuation_uncertainty")
@@ -99,62 +100,7 @@ def _apply_table_tilt(sim: FrankaMujocoSim, tilt_deg: float) -> None:
 
 
 def _save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
-    import matplotlib.pyplot as plt
-
-    data = np.load(npz_path)
-    t = data["t"]
-    err_tan = data["err_tan"]
-    fn_meas = data["fn_meas"]
-    fn_pred = data["fn_pred"]
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    plt.figure()
-    plt.plot(t, err_tan, label="Tangential error")
-    plt.xlabel("time [s]")
-    plt.ylabel("error [m]")
-    plt.title("Tangential tracking error")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(out_dir / "tangential_error.png", dpi=180)
-    plt.close()
-
-    plt.figure()
-    plt.plot(t, fn_meas, label="Fn_meas")
-    plt.plot(t, np.full_like(t, float(fn_des)), "--", label="Fn_des")
-    plt.xlabel("time [s]")
-    plt.ylabel("normal force [N]")
-    plt.title("Measured normal force")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(out_dir / "fn_meas_vs_des.png", dpi=180)
-    plt.close()
-
-    plt.figure()
-    plt.plot(t, fn_pred, label="Fn_pred")
-    plt.plot(t, np.full_like(t, float(fn_des)), "--", label="Fn_des")
-    plt.xlabel("time [s]")
-    plt.ylabel("normal force [N]")
-    plt.title("Predicted normal force (OCP)")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(out_dir / "fn_pred_vs_des.png", dpi=180)
-    plt.close()
-
-    plt.figure()
-    plt.plot(t, fn_meas, label="Fn_meas")
-    plt.plot(t, fn_pred, label="Fn_pred")
-    plt.plot(t, np.full_like(t, float(fn_des)), "--", label="Fn_des")
-    plt.xlabel("time [s]")
-    plt.ylabel("normal force [N]")
-    plt.title("Measured vs predicted normal force")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(out_dir / "fn_meas_vs_pred.png", dpi=180)
-    plt.close()
+    save_paper_plots(npz_path=npz_path, out_dir=out_dir, fn_des=fn_des)
 
 
 def _check_pin_mj_alignment(sim: FrankaMujocoSim, mpc: ClassicalCrocoddylMPC, samples: int = 16, seed: int = 0) -> dict:

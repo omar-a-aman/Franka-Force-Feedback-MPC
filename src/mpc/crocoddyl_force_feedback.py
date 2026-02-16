@@ -593,7 +593,9 @@ class ForceFeedbackCrocoddylMPC:
             ok = solver.solve(xs_init, us_init, self.cfg.max_iters, False)
             cost = float(getattr(solver, "cost", np.nan))
             iters = int(getattr(solver, "iter", -1))
-            fn_pred = self._extract_predicted_normal_force(problem) if surface_now else np.nan
+            # Log the force prediction aligned with the next control sample (t + dt_mpc),
+            # since metrics compare against the measurement taken after sim.step(...).
+            fn_pred = self._extract_predicted_normal_force_next_step(problem) if surface_now else np.nan
             solved_now = True
 
             self._last_solve_step = self._k
@@ -1198,12 +1200,39 @@ class ForceFeedbackCrocoddylMPC:
         bounds = crocoddyl.ActivationBounds(lb, ub, 1.0)
         return crocoddyl.ActivationModelQuadraticBarrier(bounds)
 
-    def _extract_predicted_normal_force(self, problem) -> float:
+    def _extract_predicted_normal_force_next_step(self, problem) -> float:
         try:
             if problem is None or len(problem.runningDatas) == 0:
                 return np.nan
 
-            rd0 = problem.runningDatas[0]
+            n_run = int(len(problem.runningDatas))
+            f0 = self._extract_predicted_normal_force(problem, knot_idx=0)
+            if n_run == 1:
+                return f0
+            f1 = self._extract_predicted_normal_force(problem, knot_idx=1)
+
+            if not np.isfinite(f0):
+                return f1
+            if not np.isfinite(f1):
+                return f0
+
+            dt_mpc = float(getattr(self.sim, "dt", self.cfg.dt))
+            dt_ocp = float(self._dt_ocp)
+            if dt_mpc >= (dt_ocp - 1.0e-9):
+                return f1
+
+            eps = self._policy_epsilon()
+            return float((1.0 - eps) * f0 + eps * f1)
+        except Exception:
+            return np.nan
+
+    def _extract_predicted_normal_force(self, problem, knot_idx: int = 0) -> float:
+        try:
+            if problem is None or len(problem.runningDatas) == 0:
+                return np.nan
+
+            idx = int(np.clip(int(knot_idx), 0, len(problem.runningDatas) - 1))
+            rd0 = problem.runningDatas[idx]
             if hasattr(rd0, "inner"):
                 rd0 = rd0.inner
             dd0 = getattr(rd0, "differential", None)
@@ -1230,25 +1259,25 @@ class ForceFeedbackCrocoddylMPC:
             f_arr = np.asarray(f_obj, dtype=float).reshape(-1)
             if contact_mode in ("normal_1d", "1d", "normal1d"):
                 if f_arr.size == 1:
-                    return float(f_arr[0])
+                    return float(abs(f_arr[0]))
                 if hasattr(f_obj, "linear"):
                     f_lin = np.asarray(f_obj.linear, dtype=float).reshape(-1)
                     if f_lin.size >= 3:
-                        return float(f_lin[2])
+                        return float(abs(f_lin[2]))
                 if f_arr.size > 0:
-                    return float(f_arr[0])
+                    return float(abs(f_arr[0]))
                 return np.nan
 
             if hasattr(f_obj, "linear"):
                 f_lin = np.asarray(f_obj.linear, dtype=float).reshape(-1)
                 if f_lin.size >= 3:
                     # Contact normal is world +z in LOCAL_WORLD_ALIGNED for the table task.
-                    return float(f_lin[2])
+                    return float(abs(f_lin[2]))
 
             if f_arr.size == 1:
-                return float(f_arr[0])
+                return float(abs(f_arr[0]))
             if f_arr.size >= 3:
-                return float(f_arr[2])
+                return float(abs(f_arr[2]))
             return np.nan
         except Exception:
             return np.nan
