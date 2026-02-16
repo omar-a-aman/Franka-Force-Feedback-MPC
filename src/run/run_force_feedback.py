@@ -10,11 +10,11 @@ import numpy as np
 import pinocchio as pin
 
 from src.mpc.crocoddyl_force_feedback import ForceFeedbackCrocoddylMPC, ForceFeedbackMPCConfig
-from src.run.paper_uncertainty import PaperUncertaintyInjector, config_for_scenario
+from src.run.uncertainty_profiles import ScenarioUncertaintyInjector, config_for_scenario
 from src.sim.franka_sim import FrankaMujocoSim
 from src.tasks.trajectories import make_approach_then_circle
 from src.utils.logging import RunLogger
-from src.utils.paper_plots import save_paper_plots
+from src.utils.evaluation_plots import save_evaluation_plots
 
 SCENE = Path("assets/scenes/panda_table_scene.xml")
 SCENARIOS = ("flat", "tilted_5", "tilted_10", "tilted_15", "actuation_uncertainty")
@@ -99,8 +99,8 @@ def _apply_table_tilt(sim: FrankaMujocoSim, tilt_deg: float) -> None:
     mujoco.mj_forward(sim.model, sim.data)
 
 
-def _save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
-    save_paper_plots(npz_path=npz_path, out_dir=out_dir, fn_des=fn_des)
+def _save_run_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
+    save_evaluation_plots(npz_path=npz_path, out_dir=out_dir, fn_des=fn_des)
 
 
 def _check_pin_mj_alignment(sim: FrankaMujocoSim, mpc: ForceFeedbackCrocoddylMPC, samples: int = 16, seed: int = 0) -> dict:
@@ -178,7 +178,7 @@ def _run_single(
     results_dir: Path,
     save_plots: bool,
     contact_model: str,
-    paper_budget: bool,
+    low_budget: bool,
     mpc_iters: Optional[int],
     use_command_filter: bool,
     align_check_samples: int,
@@ -186,17 +186,17 @@ def _run_single(
     phase_source: str,
     circle_radius: float,
     circle_omega: float,
-    paper_mode: bool,
+    benchmark_mode: bool,
 ) -> dict:
     settings = _scenario_settings(scenario)
 
     print("=" * 80)
-    print(f"Force-Feedback Panda MPC (Paper-Faithful) - Scenario: {settings['label']}")
+    print(f"Force-Feedback Panda MPC (Benchmark) - Scenario: {settings['label']}")
     print("=" * 80)
 
     sim = FrankaMujocoSim(SCENE, command_type="torque", n_substeps=5)
-    if paper_mode:
-        # Paper protocol uses a 1 kHz physics loop.
+    if benchmark_mode:
+        # Benchmark protocol uses a 1 kHz physics loop.
         sim.model.opt.timestep = 0.001
         mujoco.mj_forward(sim.model, sim.data)
     obs = sim.reset("neutral")
@@ -209,15 +209,15 @@ def _run_single(
     print(f"Scenario: {settings['label']}")
     print(
         f"Contact model: {contact_model} | command_filter={int(use_command_filter)} | "
-        f"phase_source={phase_source} | paper_mode={int(bool(paper_mode))}"
+        f"phase_source={phase_source} | benchmark_mode={int(bool(benchmark_mode))}"
     )
     print(f"FF tau_state source: {ff_tau_state_source}")
 
     _, table_center, table_half, z_table_top = _table_geometry_world(sim)
     r_tool = float(sim.model.geom_size[sim.ee_geom_id][0])
-    z_contact_offset = -8.0e-3 if paper_mode else 2.0e-4
+    z_contact_offset = -8.0e-3 if benchmark_mode else 2.0e-4
     z_contact = z_table_top + r_tool + z_contact_offset
-    z_pre = z_contact + (0.05 if paper_mode else 0.08)
+    z_pre = z_contact + (0.05 if benchmark_mode else 0.08)
 
     radius = float(circle_radius)
     omega = float(circle_omega)
@@ -227,8 +227,8 @@ def _run_single(
     print(f"Contact target: z_contact={z_contact:.4f}m (tool radius={r_tool:.4f}m)")
     print(f"Circle center (table center): {center}, radius={radius:.3f}m")
 
-    t_approach = 0.55 if paper_mode else 1.4
-    t_pre = 0.25 if paper_mode else 1.4
+    t_approach = 0.55 if benchmark_mode else 1.4
+    t_pre = 0.25 if benchmark_mode else 1.4
     traj_base = make_approach_then_circle(
         center=center,
         radius=radius,
@@ -240,7 +240,7 @@ def _run_single(
         t_pre=t_pre,
     )
     t_contact_phase = float(t_pre + t_approach)
-    t_contact_stabilize = 0.2 if paper_mode else 0.0
+    t_contact_stabilize = 0.2 if benchmark_mode else 0.0
 
     def traj(t_query: float):
         p_ref, v_ref, surf_ref = traj_base(t_query)
@@ -253,16 +253,16 @@ def _run_single(
 
     if mpc_iters is not None:
         max_iters = int(mpc_iters)
-    elif paper_mode:
+    elif benchmark_mode:
         max_iters = 10
     else:
-        max_iters = 3 if paper_budget else 10
+        max_iters = 3 if low_budget else 10
     print(
         f"MPC budget: max_iters={max_iters} "
-        f"({'paper mode default' if (paper_mode and mpc_iters is None) else ('paper budget' if paper_budget and mpc_iters is None else 'custom/dev')})"
+        f"({'benchmark default' if (benchmark_mode and mpc_iters is None) else ('low-budget' if low_budget and mpc_iters is None else 'custom/dev')})"
     )
 
-    if paper_mode:
+    if benchmark_mode:
         cfg = ForceFeedbackMPCConfig(
             horizon=40,
             dt=sim.dt,
@@ -403,10 +403,10 @@ def _run_single(
 
     uncertainty = None
     uncertainty_meta = None
-    if paper_mode:
+    if benchmark_mode:
         unc_cfg = config_for_scenario(scenario, seed=_scenario_seed(scenario))
         if unc_cfg is not None:
-            uncertainty = PaperUncertaintyInjector(
+            uncertainty = ScenarioUncertaintyInjector(
                 dt=float(sim.dt),
                 nu=7,
                 config=unc_cfg,
@@ -414,7 +414,7 @@ def _run_single(
             )
             uncertainty_meta = uncertainty.meta()
             print(
-                "Paper uncertainty enabled: "
+                "Uncertainty profile enabled: "
                 f"a=[{unc_cfg.a_min:.3f},{unc_cfg.a_max:.3f}] "
                 f"b=[{unc_cfg.b_min:.3f},{unc_cfg.b_max:.3f}] "
                 f"obs_delay={unc_cfg.delta_obs_cycles} "
@@ -440,6 +440,7 @@ def _run_single(
         "err_3d": [],
         "fn_meas": [],
         "fn_pred": [],
+        "fn_pred_raw": [],
         "contact": [],
     }
 
@@ -464,12 +465,14 @@ def _run_single(
 
         info = dict(mpc.last_info)
         fn_pred = float(info.get("fn_pred", np.nan))
+        fn_pred_raw = float(info.get("fn_pred_raw", np.nan))
 
         summary["t"].append(t_next)
         summary["err_tan"].append(err_tan)
         summary["err_3d"].append(err_3d)
         summary["fn_meas"].append(fn_meas)
         summary["fn_pred"].append(fn_pred)
+        summary["fn_pred_raw"].append(fn_pred_raw)
         summary["contact"].append(1.0 if in_contact else 0.0)
 
         logger.log(
@@ -482,6 +485,7 @@ def _run_single(
             err_3d=err_3d,
             fn_meas=fn_meas,
             fn_pred=fn_pred,
+            fn_pred_raw=fn_pred_raw,
             fn_des=float(cfg.fn_des),
             tau_cmd=np.asarray(tau_cmd, dtype=float).copy(),
             tau_meas=np.asarray(obs_next.tau_meas, dtype=float).copy(),
@@ -566,8 +570,8 @@ def _run_single(
         fn_pred_definition="Predicted normal-force variable in the OCP contact model (may not equal physical table-normal force under tilt mismatch).",
         contact_definition="in_contact = (fn_meas > 0.5 N)",
         tau_meas_lpf_alpha=float(sim.tau_meas_lpf_alpha),
-        paper_mode=bool(paper_mode),
-        paper_uncertainty=uncertainty_meta,
+        benchmark_mode=bool(benchmark_mode),
+        uncertainty_profile=uncertainty_meta,
         torque_scale=np.asarray(torque_scale, dtype=float),
         fn_des=float(cfg.fn_des),
         avg_abs_position_err=avg_abs_pos_err,
@@ -613,7 +617,7 @@ def _run_single(
     logger.save()
 
     if save_plots:
-        _save_paper_plots(logger.path_npz, logger.run_dir, cfg.fn_des)
+        _save_run_plots(logger.path_npz, logger.run_dir, cfg.fn_des)
 
     print()
     print("=" * 80)
@@ -657,7 +661,7 @@ def main(
     results_dir: Path,
     no_plots: bool,
     contact_model: str,
-    paper_budget: bool,
+    low_budget: bool,
     mpc_iters: Optional[int],
     use_command_filter: bool,
     align_check_samples: int,
@@ -665,7 +669,7 @@ def main(
     phase_source: str,
     circle_radius: float,
     circle_omega: float,
-    paper_mode: bool,
+    benchmark_mode: bool,
 ):
     if all_scenarios:
         if not no_viewer:
@@ -680,7 +684,7 @@ def main(
                     results_dir=results_dir,
                     save_plots=(not no_plots),
                     contact_model=contact_model,
-                    paper_budget=paper_budget,
+                    low_budget=low_budget,
                     mpc_iters=mpc_iters,
                     use_command_filter=use_command_filter,
                     align_check_samples=align_check_samples,
@@ -688,7 +692,7 @@ def main(
                     phase_source=phase_source,
                     circle_radius=circle_radius,
                     circle_omega=circle_omega,
-                    paper_mode=paper_mode,
+                    benchmark_mode=benchmark_mode,
                 )
             )
 
@@ -713,7 +717,7 @@ def main(
         results_dir=results_dir,
         save_plots=(not no_plots),
         contact_model=contact_model,
-        paper_budget=paper_budget,
+        low_budget=low_budget,
         mpc_iters=mpc_iters,
         use_command_filter=use_command_filter,
         align_check_samples=align_check_samples,
@@ -721,7 +725,7 @@ def main(
         phase_source=phase_source,
         circle_radius=circle_radius,
         circle_omega=circle_omega,
-        paper_mode=paper_mode,
+        benchmark_mode=benchmark_mode,
     )
 
 
@@ -755,7 +759,7 @@ if __name__ == "__main__":
         default="tau_meas_act_filt",
         help="Torque-state source used by force-feedback augmentation.",
     )
-    parser.add_argument("--paper-budget", action="store_true", help="Use paper-like small DDP iteration budget.")
+    parser.add_argument("--low-budget", action="store_true", help="Use low DDP iteration budget.")
     parser.add_argument("--mpc-iters", type=int, default=None, help="Override DDP max iterations per MPC solve.")
     parser.add_argument("--circle-radius", type=float, default=0.10, help="Circle radius [m].")
     parser.add_argument("--circle-omega", type=float, default=1.5, help="Circle angular velocity [rad/s].")
@@ -771,18 +775,18 @@ if __name__ == "__main__":
         help="Number of random q samples for MuJoCo↔Pinocchio EE alignment check (0 disables).",
     )
     parser.add_argument(
-        "--paper-mode",
-        dest="paper_mode",
+        "--benchmark-mode",
+        dest="benchmark_mode",
         action="store_true",
-        help="Enable strict paper-mode protocol (default).",
+        help="Enable benchmark protocol (default).",
     )
     parser.add_argument(
-        "--no-paper-mode",
-        dest="paper_mode",
+        "--no-benchmark-mode",
+        dest="benchmark_mode",
         action="store_false",
-        help="Disable strict paper-mode protocol and use development settings.",
+        help="Disable benchmark protocol and use development settings.",
     )
-    parser.set_defaults(paper_mode=True)
+    parser.set_defaults(benchmark_mode=True)
     args = parser.parse_args()
 
     main(
@@ -793,7 +797,7 @@ if __name__ == "__main__":
         results_dir=args.results_dir,
         no_plots=args.no_plots,
         contact_model=args.contact_model,
-        paper_budget=args.paper_budget,
+        low_budget=args.low_budget,
         mpc_iters=args.mpc_iters,
         use_command_filter=args.use_command_filter,
         align_check_samples=args.align_check_samples,
@@ -801,5 +805,5 @@ if __name__ == "__main__":
         phase_source=args.phase_source,
         circle_radius=args.circle_radius,
         circle_omega=args.circle_omega,
-        paper_mode=args.paper_mode,
+        benchmark_mode=args.benchmark_mode,
     )

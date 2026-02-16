@@ -10,9 +10,9 @@ from src.sim.franka_sim import Observation
 
 
 @dataclass
-class PaperUncertaintyConfig:
+class UncertaintyProfileConfig:
     """
-    Uncertainty model used for paper-mode protocol (Eq. 21 style):
+    Uncertainty profile for benchmark protocol:
       - actuation gain/bias uncertainty on delayed command torque
       - delayed/noisy state measurements
       - noisy delayed torque measurements
@@ -30,16 +30,14 @@ class PaperUncertaintyConfig:
     seed: int = 0
 
 
-def config_for_scenario(scenario: str, seed: int = 0) -> Optional[PaperUncertaintyConfig]:
+def config_for_scenario(scenario: str, seed: int = 0) -> Optional[UncertaintyProfileConfig]:
     """
-    Shared paper-mode uncertainty presets.
+    Shared uncertainty presets.
     Returns None for scenarios without injected uncertainty.
     """
     name = str(scenario).strip().lower()
     if name == "actuation_uncertainty":
-        # Matches the paper-style uncertainty stress test:
-        # delayed command, delayed/noisy observation, uncertain actuation map.
-        return PaperUncertaintyConfig(
+        return UncertaintyProfileConfig(
             a_min=0.95,
             a_max=1.05,
             b_min=-0.10,
@@ -83,12 +81,12 @@ def _copy_observation(obs: Observation) -> Observation:
     )
 
 
-class PaperUncertaintyInjector:
+class ScenarioUncertaintyInjector:
     def __init__(
         self,
         dt: float,
         nu: int,
-        config: PaperUncertaintyConfig,
+        config: UncertaintyProfileConfig,
         tau_lpf_alpha: float = 0.2,
     ):
         self.dt = float(max(dt, 1.0e-9))
@@ -100,7 +98,7 @@ class PaperUncertaintyInjector:
         self.b = float(self.rng.uniform(float(config.b_min), float(config.b_max)))
         self.obs_delay_cycles_1khz = int(max(config.delta_obs_cycles, 0))
 
-        # delta_obs_cycles in the paper is given at 1 kHz simulation rate.
+        # delta_obs_cycles is defined at 1 kHz simulation rate.
         # Convert it to the current control-step discretization.
         obs_delay_s = float(self.obs_delay_cycles_1khz) * 1.0e-3
         self.obs_delay_steps = int(max(np.round(obs_delay_s / self.dt), 0))

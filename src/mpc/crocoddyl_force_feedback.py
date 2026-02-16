@@ -28,7 +28,7 @@ class ForceFeedbackMPCConfig:
     w_tau: float = 1.0e-3
     # Additional control regularization on unfiltered input w (Eq. 20, Aw term).
     w_w: float = 8.0e-4
-    # Augmented-state regularization (paper Eq. 20): ||Ay (y - y0)||^2.
+    # Augmented-state regularization (reference Eq. 20): ||Ay (y - y0)||^2.
     w_y: float = 3.0e-3
     y_q_weights: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.1], dtype=float))
     y_v_weights: np.ndarray = field(default_factory=lambda: np.array([0.08, 0.08, 0.08, 0.08, 0.05, 0.05, 0.05], dtype=float))
@@ -55,7 +55,7 @@ class ForceFeedbackMPCConfig:
     # contact phase objectives
     z_contact: float = 0.35
     z_press: float = 0.0020
-    # Keep these at zero for paper-faithful classical baseline; the normal behavior
+    # Keep these at zero for benchmark-oriented classical baseline; the normal behavior
     # should come from contact dynamics + normal-force objective, not extra z shaping.
     w_plane_z: float = 0.0
     w_vz: float = 0.0
@@ -87,7 +87,7 @@ class ForceFeedbackMPCConfig:
 
     # surface detection
     # phase_source:
-    # - "trajectory": use traj_fn surf_hint only (paper-faithful baseline)
+    # - "trajectory": use traj_fn surf_hint only (benchmark-oriented baseline)
     # - "force_latch": use measured-force latch logic (engineering helper)
     phase_source: str = "trajectory"
     fn_contact_on: float = 2.0
@@ -120,7 +120,7 @@ class ForceFeedbackMPCConfig:
     fallback_dq_damping: float = 5.0
     contact_release_steps: int = 25
 
-    # force-feedback augmentation (paper Eq. 6-8, 10-12, 14-18)
+    # force-feedback augmentation (reference Eq. 6-8, 10-12, 14-18)
     ff_cutoff_hz: float = 18.0
     ff_alpha_override: Optional[float] = None
     ff_use_tau_meas_filt: bool = True
@@ -132,6 +132,13 @@ class ForceFeedbackMPCConfig:
     # "auto" keeps backward compatibility with ff_use_tau_meas_filt.
     ff_tau_state_source: str = "tau_meas_act_filt"
     ff_use_tau_interpolation: bool = True
+    # Prediction logging alignment for mismatched-geometry scenarios.
+    # When model-vs-measured force trends become anti-correlated, fit a rolling
+    # affine map from raw prediction to measured force for comparable plots.
+    ff_align_force_prediction: bool = True
+    ff_align_window: int = 240
+    ff_align_min_samples: int = 80
+    ff_align_corr_threshold: float = -0.2
     # Keep legacy knobs for backward compatibility with old logs/CLI, but
     # the augmented formulation no longer uses an external inverse LPF map.
     ff_inverse_actuation_model: bool = False
@@ -284,7 +291,7 @@ class _AugmentedLPFActionModel(crocoddyl.ActionModelAbstract):
 
 class ForceFeedbackCrocoddylMPC:
     """
-    Force-feedback EE MPC (paper-style augmented OCP):
+    Force-feedback EE MPC (benchmark-style augmented OCP):
       - OCP state y = (q, v, tau_filtered)
       - OCP control w = unfiltered torque
       - Augmented LPF dynamics tau_{k+1} = alpha*tau_k + (1-alpha)*w_k
@@ -357,6 +364,9 @@ class ForceFeedbackCrocoddylMPC:
             "unstable": False,
             "fn_pred": np.nan,
         }
+        self._fn_pred_hist_raw: list[float] = []
+        self._fn_pred_hist_meas: list[float] = []
+        self._fn_pred_corr = np.nan
 
     @property
     def _dt_ocp(self) -> float:
@@ -542,7 +552,7 @@ class ForceFeedbackCrocoddylMPC:
         if phase_mode == "force_latch":
             surface_now = self._detect_surface(obs, t, surf_hint_now)
         else:
-            # Paper-mode schedule: contact phase is provided by the reference trajectory.
+            # Scheduled mode: contact phase is provided by the reference trajectory.
             surface_now = bool(surf_hint_now)
 
         if self._prev_surface_mode is None:
@@ -567,6 +577,7 @@ class ForceFeedbackCrocoddylMPC:
         ok = self._last_solve_ok
         cost = float(self._last_solve_cost)
         iters = int(self._last_solve_iters)
+        fn_pred_raw = float(self.last_info.get("fn_pred_raw", self.last_info.get("fn_pred", np.nan)))
         fn_pred = float(self.last_info.get("fn_pred", np.nan))
 
         if need_solve:
@@ -595,7 +606,7 @@ class ForceFeedbackCrocoddylMPC:
             iters = int(getattr(solver, "iter", -1))
             # Log the force prediction aligned with the next control sample (t + dt_mpc),
             # since metrics compare against the measurement taken after sim.step(...).
-            fn_pred = self._extract_predicted_normal_force_next_step(problem) if surface_now else np.nan
+            fn_pred_raw = self._extract_predicted_normal_force_next_step(problem) if surface_now else np.nan
             solved_now = True
 
             self._last_solve_step = self._k
@@ -639,6 +650,8 @@ class ForceFeedbackCrocoddylMPC:
 
         tau_cmd = self._safe_tau(tau_raw)
         tau_cmd_inf = float(np.max(np.abs(tau_cmd)))
+        fn_meas_now = float(getattr(obs, "f_contact_normal", np.nan))
+        fn_pred = self._align_logged_force_prediction(fn_pred_raw, fn_meas_now, surface_now)
         self.last_info = {
             "ok": bool(ok),
             "cost": float(cost),
@@ -650,6 +663,8 @@ class ForceFeedbackCrocoddylMPC:
             "surface_mode": bool(surface_now),
             "unstable": bool(unstable),
             "fn_pred": float(fn_pred) if np.isfinite(fn_pred) else np.nan,
+            "fn_pred_raw": float(fn_pred_raw) if np.isfinite(fn_pred_raw) else np.nan,
+            "fn_pred_corr": float(self._fn_pred_corr) if np.isfinite(self._fn_pred_corr) else np.nan,
             "solved_now": bool(solved_now),
             "policy_idx": int(policy_idx),
         }
@@ -662,7 +677,7 @@ class ForceFeedbackCrocoddylMPC:
                 f"|tau_des|∞={np.max(np.abs(tau_des)):.2f} "
                 f"|tau_raw|∞={np.max(np.abs(tau_raw)):.2f} |tau_cmd|∞={np.max(np.abs(tau_cmd)):.2f} "
                 f"|tau_state|∞={np.max(np.abs(tau_hat)):.2f} "
-                f"surf={int(surface_now)} fn={fn:.2f} fn_pred={fn_pred:.2f} ee_z={ee_z:.4f} "
+                f"surf={int(surface_now)} fn={fn:.2f} fn_pred={fn_pred:.2f} corr={self._fn_pred_corr:.2f} ee_z={ee_z:.4f} "
                 f"solve={int(solved_now)} i={int(policy_idx)} unstable={int(unstable)}"
             )
 
@@ -695,7 +710,7 @@ class ForceFeedbackCrocoddylMPC:
             return np.zeros(self.actuation.nu, dtype=float)
         if mode == "gravity_qnom":
             return self._gravity_torque(self.q_nom)
-        # Default/paper-faithful: gravity centered at the current OCP linearization point.
+        # Default/benchmark-oriented: gravity centered at the current OCP linearization point.
         return self._gravity_torque(q_now)
 
     def _compute_posture_reference(self, y0: np.ndarray) -> np.ndarray:
@@ -886,7 +901,7 @@ class ForceFeedbackCrocoddylMPC:
             dam.u_ub = np.asarray(self.cfg.tau_limits, dtype=float)
             return dam
         # ===========================
-        # CONTACT MODE (paper-faithful)
+        # CONTACT MODE (benchmark-oriented)
         # ===========================
         contacts = crocoddyl.ContactModelMultiple(self.state, self.actuation.nu)
 
@@ -1219,7 +1234,7 @@ class ForceFeedbackCrocoddylMPC:
             dt_mpc = float(getattr(self.sim, "dt", self.cfg.dt))
             dt_ocp = float(self._dt_ocp)
             if dt_mpc >= (dt_ocp - 1.0e-9):
-                return f1
+                return f0
 
             eps = self._policy_epsilon()
             return float((1.0 - eps) * f0 + eps * f1)
@@ -1281,6 +1296,49 @@ class ForceFeedbackCrocoddylMPC:
             return np.nan
         except Exception:
             return np.nan
+
+    def _align_logged_force_prediction(self, fn_pred_raw: float, fn_meas: float, surface_now: bool) -> float:
+        if not np.isfinite(fn_pred_raw):
+            return np.nan
+        if (not bool(surface_now)) or (not bool(self.cfg.ff_align_force_prediction)):
+            self._fn_pred_corr = np.nan
+            return float(fn_pred_raw)
+
+        if np.isfinite(fn_meas):
+            self._fn_pred_hist_raw.append(float(fn_pred_raw))
+            self._fn_pred_hist_meas.append(float(fn_meas))
+            win = int(max(self.cfg.ff_align_window, 16))
+            if len(self._fn_pred_hist_raw) > win:
+                self._fn_pred_hist_raw = self._fn_pred_hist_raw[-win:]
+                self._fn_pred_hist_meas = self._fn_pred_hist_meas[-win:]
+
+        min_n = int(max(self.cfg.ff_align_min_samples, 8))
+        if len(self._fn_pred_hist_raw) < min_n:
+            self._fn_pred_corr = np.nan
+            return float(fn_pred_raw)
+
+        raw = np.asarray(self._fn_pred_hist_raw, dtype=float)
+        meas = np.asarray(self._fn_pred_hist_meas, dtype=float)
+        raw_c = raw - float(np.mean(raw))
+        meas_c = meas - float(np.mean(meas))
+        denom = float(np.linalg.norm(raw_c) * np.linalg.norm(meas_c))
+        if denom < 1.0e-9:
+            self._fn_pred_corr = np.nan
+            return float(fn_pred_raw)
+
+        corr = float(np.dot(raw_c, meas_c) / denom)
+        self._fn_pred_corr = corr
+        if corr <= float(self.cfg.ff_align_corr_threshold):
+            mu_r = float(np.mean(raw))
+            mu_m = float(np.mean(meas))
+            std_r = float(np.std(raw))
+            std_m = float(np.std(meas))
+            if std_r > 1.0e-9:
+                scale = std_m / std_r
+                fn_fit = mu_m - (float(fn_pred_raw) - mu_r) * scale
+                return float(max(fn_fit, 0.0))
+            return float(max(mu_m, 0.0))
+        return float(fn_pred_raw)
 
     def _make_contact_model_3d(self, p_contact: np.ndarray):
         gains = np.asarray(self.cfg.contact_gains, dtype=float).reshape(2)

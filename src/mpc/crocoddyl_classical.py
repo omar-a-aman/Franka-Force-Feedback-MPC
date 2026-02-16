@@ -28,7 +28,7 @@ class ClassicalMPCConfig:
     w_tau: float = 1.0e-3
     w_tau_smooth: float = 5.0e-2  # used in command filter
     # State regularization reference mode:
-    # - "x0": current measured state at MPC solve (paper-faithful Eq. 19)
+    # - "x0": current measured state at MPC solve (benchmark-oriented Eq. 19)
     # - "q_nom": fixed nominal posture
     posture_ref_mode: str = "x0"
     # Torque regularization target mode:
@@ -44,7 +44,7 @@ class ClassicalMPCConfig:
     # contact phase objectives
     z_contact: float = 0.35
     z_press: float = 0.0020
-    # Keep these at zero for paper-faithful classical baseline; the normal behavior
+    # Keep these at zero for benchmark-oriented classical baseline; the normal behavior
     # should come from contact dynamics + normal-force objective, not extra z shaping.
     w_plane_z: float = 0.0
     w_vz: float = 0.0
@@ -76,7 +76,7 @@ class ClassicalMPCConfig:
 
     # surface detection
     # phase_source:
-    # - "trajectory": use traj_fn surf_hint only (paper-faithful baseline)
+    # - "trajectory": use traj_fn surf_hint only (benchmark-oriented baseline)
     # - "force_latch": use measured-force latch logic (engineering helper)
     phase_source: str = "trajectory"
     fn_contact_on: float = 2.0
@@ -314,7 +314,7 @@ class ClassicalCrocoddylMPC:
         if phase_mode == "force_latch":
             surface_now = self._detect_surface(obs, t, surf_hint_now)
         else:
-            # Paper-mode schedule: contact phase is provided by the reference trajectory.
+            # Scheduled mode: contact phase is provided by the reference trajectory.
             surface_now = bool(surf_hint_now)
 
         if self._prev_surface_mode is None:
@@ -456,7 +456,7 @@ class ClassicalCrocoddylMPC:
             return np.zeros(self.actuation.nu, dtype=float)
         if mode == "gravity_qnom":
             return self._gravity_torque(self.q_nom)
-        # Default/paper-faithful: gravity centered at the current OCP linearization point.
+        # Default/benchmark-oriented: gravity centered at the current OCP linearization point.
         return self._gravity_torque(q_now)
 
     def _compute_posture_reference(self, x0: np.ndarray) -> np.ndarray:
@@ -621,7 +621,7 @@ class ClassicalCrocoddylMPC:
             dam.u_ub = np.asarray(self.cfg.tau_limits, dtype=float)
             return dam
         # ===========================
-        # CONTACT MODE (paper-faithful)
+        # CONTACT MODE (benchmark-oriented)
         # ===========================
         contacts = crocoddyl.ContactModelMultiple(self.state, self.actuation.nu)
 

@@ -9,7 +9,7 @@ import numpy as np
 def _configure_matplotlib():
     import matplotlib.pyplot as plt
 
-    # Always keep a deterministic fallback style when LaTeX is unavailable.
+    # Keep deterministic rendering defaults when system LaTeX is unavailable.
     plt.rcParams.update(
         {
             "figure.figsize": (8.5, 4.8),
@@ -58,7 +58,7 @@ def _style_reference_vs_measured(ax, t, ref, meas, ylabel: str):
     ax.grid(True)
 
 
-def save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
+def save_evaluation_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     import matplotlib.pyplot as plt
 
     _configure_matplotlib()
@@ -74,7 +74,6 @@ def save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Tangential tracking error
     fig, ax = plt.subplots()
     ax.plot(t, err_tan, "-", color="#2B8A3E", linewidth=1.5)
     ax.set_xlabel(r"$t\;(\mathrm{s})$")
@@ -85,7 +84,6 @@ def save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     fig.savefig(out_dir / "tangential_error.png", dpi=200)
     plt.close(fig)
 
-    # Measured normal force vs desired
     fig, ax = plt.subplots()
     ax.plot(t, np.full_like(t, float(fn_des)), "--", color="#4C6EF5", linewidth=1.6, label="Reference")
     ax.plot(t, fn_meas, "-", color="#E03131", linewidth=1.4, label="Measured")
@@ -98,20 +96,18 @@ def save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     fig.savefig(out_dir / "fn_meas_vs_des.png", dpi=200)
     plt.close(fig)
 
-    # Predicted normal force vs desired
     fig, ax = plt.subplots()
     ax.plot(t, np.full_like(t, float(fn_des)), "--", color="#4C6EF5", linewidth=1.6, label="Reference")
     ax.plot(t, fn_pred, "-", color="#2B8A3E", linewidth=1.4, label="Predicted")
     ax.set_xlabel(r"$t\;(\mathrm{s})$")
     ax.set_ylabel(r"$\lambda_n\;(\mathrm{N})$")
-    ax.set_title("Predicted Normal Force (OCP)")
+    ax.set_title("Predicted Normal Force")
     ax.legend(loc="upper right")
     ax.grid(True)
     fig.tight_layout()
     fig.savefig(out_dir / "fn_pred_vs_des.png", dpi=200)
     plt.close(fig)
 
-    # Measured vs predicted
     fig, ax = plt.subplots()
     ax.plot(t, np.full_like(t, float(fn_des)), "--", color="#4C6EF5", linewidth=1.6, label="Reference")
     ax.plot(t, fn_pred, "-", color="#2B8A3E", linewidth=1.4, label="Predicted")
@@ -130,7 +126,6 @@ def save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     if ee_ref.shape[1] < 2 or ee_pos.shape[1] < 2:
         return
 
-    # Combined x/y tracking figure (paper-like layout)
     fig, axs = plt.subplots(2, 1, sharex=True, figsize=(9.0, 7.0))
     _style_reference_vs_measured(axs[0], t, ee_ref[:, 0], ee_pos[:, 0], r"$p_x^{EE}\;(\mathrm{m})$")
     _style_reference_vs_measured(axs[1], t, ee_ref[:, 1], ee_pos[:, 1], r"$p_y^{EE}\;(\mathrm{m})$")
@@ -139,7 +134,6 @@ def save_paper_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     fig.savefig(out_dir / "ee_xy_ref_vs_meas.png", dpi=220)
     plt.close(fig)
 
-    # Separate x and y figures
     fig, ax = plt.subplots()
     _style_reference_vs_measured(ax, t, ee_ref[:, 0], ee_pos[:, 0], r"$p_x^{EE}\;(\mathrm{m})$")
     ax.set_title("End-Effector X Tracking")

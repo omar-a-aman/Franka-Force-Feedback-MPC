@@ -1,68 +1,175 @@
-# Franka Force-Feedback MPC - Classical MPC Fixed
+# Franka Force-Feedback MPC
 
-## Status: ✅ COMPLETE
+This repository implements and evaluates two torque-space MPC controllers for
+contact-rich end-effector tasks in MuJoCo with a Franka Panda model:
 
-All critical bugs in the classical MPC controller have been identified and fixed. The controller now:
-- ✅ Smoothly approaches the table
-- ✅ Maintains stable contact with proper force
-- ✅ Follows circular trajectory without oscillation
-- ✅ Handles torque limits and safety constraints
+- `ClassicalCrocoddylMPC` (state `(q, v)`, control `tau`)
+- `ForceFeedbackCrocoddylMPC` (augmented state `(q, v, tau_hat)`, control `w`)
+
+Both controllers are configured for a staged task:
+
+1. approach the table,
+2. establish contact,
+3. track a circle on the table while regulating normal force.
+
+The codebase is organized to make controller comparison reproducible across
+flat, tilted, and uncertainty scenarios.
+
+## Repository Structure
+
+- `src/mpc/`: controller implementations and MPC configs
+- `src/run/`: runnable evaluation scripts and scenario setup
+- `src/sim/`: MuJoCo simulation wrapper and smoke-test scripts
+- `src/tasks/`: trajectory generators
+- `src/utils/`: logging and plotting utilities
+- `assets/scenes/`: Panda + table MuJoCo scenes used by evaluations
+- `assets/mujoco_menagerie/`: vendored third-party robot assets
+- `scripts/`: helper shell scripts
+- `results/`: generated run artifacts
+
+Each major subfolder has its own README.
+
+## Environment Setup
+
+### 1) Create and activate the conda environment
+
+```bash
+conda env create -f environment.yml
+conda activate franka-mpc
+```
+
+### 2) Sanity-check key imports
+
+```bash
+python3 -c "import mujoco, crocoddyl, pinocchio; print('ok')"
+```
 
 ## Quick Start
 
-### Run the fixed controller:
+Run from repository root.
+
+### Classical MPC
+
 ```bash
-python src/mpc/test_crocoddyl.py
+python3 src/run/run_classical.py --scenario flat --time 20.0 --no-viewer
 ```
 
-### Verify all fixes:
+### Force-Feedback MPC
+
 ```bash
-python verify_fixes.py
+python3 src/run/run_force_feedback.py --scenario flat --time 20.0 --no-viewer
 ```
 
-### See what changed:
+### Sweep all scenarios
+
 ```bash
-python show_changes.py
+python3 src/run/run_classical.py --all-scenarios
+python3 src/run/run_force_feedback.py --all-scenarios
 ```
 
-## Documentation
+`--all-scenarios` automatically runs without the viewer.
 
-- **[README_FIXES.md](README_FIXES.md)** - Quick reference of what was fixed
-- **[FIXES_COMPLETE.md](FIXES_COMPLETE.md)** - Complete analysis of all 9 issues
-- **[FIXES_DETAILED.md](FIXES_DETAILED.md)** - Technical deep-dive into each bug
-- **[CHECKLIST_VISUAL.txt](CHECKLIST_VISUAL.txt)** - Visual before/after comparison
+## Scenarios
 
-## The 9 Critical Bugs Fixed
+Available in both run scripts:
 
-| # | Issue | Fix |
-|---|-------|-----|
-| 1 | Torque smoothing non-functional | Proper control regularization |
-| 2 | Z-press logic inverted | Correct penetration depth interpretation |
-| 3 | Posture control too weak | Increased kp from 50 to 100 |
-| 4 | Velocity damping too strong | Reduced w_v from 60 to 1.0 |
-| 5 | Torque smoothing too strong | Reduced w_tau_smooth from 6 to 1.0 |
-| 6 | Z velocity not damped | Separate XY/Z tracking with proper masks |
-| 7 | Joint-unaware velocity damping | Per-joint weights [1,1,1,1,0.3,0.3,0.3] |
-| 8 | Unreachable circle center | Moved from behind (bad) to forward (reachable) |
-| 9 | Unbalanced position tracking | Z weight = 0.5x during approach (gravity-assisted) |
+- `flat`
+- `tilted_5`
+- `tilted_10`
+- `tilted_15`
+- `actuation_uncertainty`
 
-## Files Modified
+Backward-compatible alias:
 
-- ✅ `src/mpc/crocoddyl_classical.py` - Completely rewritten with correct cost formulation
-- ✅ `src/mpc/test_crocoddyl.py` - Improved test harness and logging
-- ✅ `src/tasks/trajectories.py` - Better documentation
+- `tilted` (legacy single tilted setup)
 
-## Next Steps
+## Runtime Modes and Controllers
 
-This is the **baseline** classical MPC (no force feedback). Next:
+Both runners default to `--benchmark-mode`.
 
-1. Verify stability with disturbances
-2. Implement force-feedback MPC (augmented state with filtered torque)
-3. Compare controllers on same task
-4. Measure improvement from force feedback
+- `--benchmark-mode`:
+  - uses benchmark-oriented controller settings,
+  - uses 1 kHz MuJoCo physics step with `n_substeps=5` (`sim.dt = 0.005 s`),
+  - enables shared uncertainty injection in `actuation_uncertainty`.
+- `--no-benchmark-mode`:
+  - uses development settings and disables benchmark uncertainty profile.
 
-## Project Timeline
+## Common CLI Options
 
-Phase 1: ✅ **Classical MPC (COMPLETE)**
-Phase 2: ⏳ **Force-Feedback MPC (NEXT)**  
-Phase 3: ⏳ **Comparison & Analysis**
+For both `run_classical.py` and `run_force_feedback.py`:
+
+- `--scenario {flat,tilted_5,tilted_10,tilted_15,actuation_uncertainty,tilted}`
+- `--all-scenarios`
+- `--no-viewer`
+- `--time <seconds>`
+- `--results-dir <path>`
+- `--no-plots`
+- `--contact-model {normal_1d,point3d}`
+- `--phase-source {trajectory,force_latch}`
+- `--circle-radius <m>` (default `0.10`)
+- `--circle-omega <rad/s>` (default `1.5`)
+- `--mpc-iters <int>` (hard override of solver iterations)
+- `--low-budget` (only affects non-benchmark default budgets)
+- `--use-command-filter`
+- `--align-check-samples <int>` (MuJoCo/Pinocchio alignment check, `0` disables)
+
+Additional Force-Feedback option:
+
+- `--ff-tau-state-source {auto,tau_meas_act_filt,tau_meas_act,tau_cmd,tau_meas_filt,tau_meas,tau_total}`
+
+## Output Artifacts
+
+Each run creates:
+
+- `results/<controller>_eval/logs/<timestamp>_<run_name>/data.npz`
+- `results/<controller>_eval/logs/<timestamp>_<run_name>/data.csv`
+- `results/<controller>_eval/logs/<timestamp>_<run_name>/meta.json`
+- PNG plots (unless `--no-plots`)
+
+Primary metrics printed in terminal and stored in metadata include:
+
+- tangential tracking error,
+- 3D tracking error,
+- average absolute force error,
+- max normal force,
+- contact-loss percentage.
+
+## Typical Evaluation Commands
+
+### A) Baseline benchmark comparison
+
+```bash
+python3 src/run/run_classical.py --scenario flat --time 30 --no-viewer
+python3 src/run/run_force_feedback.py --scenario flat --time 30 --no-viewer
+```
+
+### B) Tilt robustness
+
+```bash
+python3 src/run/run_classical.py --scenario tilted_10 --time 30 --no-viewer
+python3 src/run/run_force_feedback.py --scenario tilted_10 --time 30 --no-viewer
+```
+
+### C) Uncertainty robustness
+
+```bash
+python3 src/run/run_classical.py --scenario actuation_uncertainty --time 30 --no-viewer
+python3 src/run/run_force_feedback.py --scenario actuation_uncertainty --time 30 --no-viewer
+```
+
+## Troubleshooting
+
+- Viewer issues on headless machines:
+  - run with `--no-viewer`
+- Divergent/unstable behavior:
+  - reduce task aggressiveness (`--circle-omega`, `--circle-radius`)
+  - increase `--mpc-iters`
+  - run `--align-check-samples 16` or higher to confirm frame alignment
+- Very slow runs:
+  - use `--no-viewer`
+  - reduce experiment time
+
+## Notes
+
+- `assets/mujoco_menagerie/` is a vendored third-party asset bundle.
+- Project-specific scene files for this repository are in `assets/scenes/`.
