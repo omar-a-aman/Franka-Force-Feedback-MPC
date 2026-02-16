@@ -26,15 +26,30 @@ class ForceFeedbackMPCConfig:
     w_posture: float = 5.0e-1
     w_v: float = 2.5e-1
     w_tau: float = 1.0e-3
+    # Additional control regularization on unfiltered input w (Eq. 20, Aw term).
+    w_w: float = 8.0e-4
+    # Augmented-state regularization (paper Eq. 20): ||Ay (y - y0)||^2.
+    w_y: float = 3.0e-3
+    y_q_weights: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2, 0.2, 0.2, 0.1, 0.1, 0.1], dtype=float))
+    y_v_weights: np.ndarray = field(default_factory=lambda: np.array([0.08, 0.08, 0.08, 0.08, 0.05, 0.05, 0.05], dtype=float))
+    y_tau_weights: np.ndarray = field(default_factory=lambda: np.array([0.35, 0.35, 0.35, 0.35, 0.2, 0.2, 0.2], dtype=float))
+    # Keep inner-model state/torque regularizers optional for engineering fallback.
+    use_inner_state_reg: bool = True
+    use_inner_tau_reg: bool = True
     w_tau_smooth: float = 5.0e-2  # used in command filter
+    # Posture regularization target:
+    # - "q_nom": fixed nominal posture (more robust against null-space drift)
+    # - "x0": current measured state at MPC solve time
+    posture_ref_mode: str = "x0"
     # Torque regularization target mode:
     # - "gravity_x0": tau_ref = tau_g(q0) each MPC update
     # - "gravity_qnom": tau_ref = tau_g(q_nom)
     # - "zero": tau_ref = 0
     torque_ref_mode: str = "gravity_x0"
-    w_tau_soft_limits: float = 2.0
+    w_tau_soft_limits: float = 1.5
+    w_w_soft_limits: float = 2.0
     tau_soft_limit_margin: float = 0.2  # Nm kept away from hard bounds
-    w_q_soft_limits: float = 10.0
+    w_q_soft_limits: float = 8.0
     q_soft_limit_margin: float = 0.05  # rad
 
     # contact phase objectives
@@ -96,7 +111,7 @@ class ForceFeedbackMPCConfig:
     use_box_fddp: bool = True
     mpc_update_steps: int = 1  # solve OCP every N control steps (>=1)
     use_feedback_policy: bool = True  # apply u = u_ff + K * dx between MPC solves
-    feedback_gain_scale: float = 0.2
+    feedback_gain_scale: float = 0.35
     verbose: bool = False
     debug_every: int = 25
     # numerical safety guard for solver blow-ups
@@ -105,24 +120,176 @@ class ForceFeedbackMPCConfig:
     fallback_dq_damping: float = 5.0
     contact_release_steps: int = 25
 
-    # force-feedback augmentation (paper-inspired torque-state handling)
-    ff_cutoff_hz: float = 25.0
+    # force-feedback augmentation (paper Eq. 6-8, 10-12, 14-18)
+    ff_cutoff_hz: float = 18.0
     ff_alpha_override: Optional[float] = None
     ff_use_tau_meas_filt: bool = True
-    ff_inverse_actuation_model: bool = True
-    ff_tau_feedback_gain: float = 1.0
+    # Preferred sources:
+    # - "tau_meas_act_filt": tau_cmd + tau_act low-pass filtered (default)
+    # - "tau_meas_act": tau_cmd + tau_act
+    # - "tau_cmd": commanded joint torque only
+    # Optional fallbacks: "tau_meas_filt", "tau_meas", "tau_total"
+    # "auto" keeps backward compatibility with ff_use_tau_meas_filt.
+    ff_tau_state_source: str = "tau_meas_act_filt"
     ff_use_tau_interpolation: bool = True
+    # Keep legacy knobs for backward compatibility with old logs/CLI, but
+    # the augmented formulation no longer uses an external inverse LPF map.
+    ff_inverse_actuation_model: bool = False
+    ff_tau_feedback_gain: float = 1.0
+
+
+class _AugmentedLPFActionModel(crocoddyl.ActionModelAbstract):
+    """
+    Discrete augmented action model for y=(x,tau), control w:
+      x_{k+1}   = F(x_k, tau_k)          (inner integrated multibody model)
+      tau_{k+1} = alpha*tau_k + (1-alpha)*w_k
+    """
+
+    def __init__(
+        self,
+        inner_model,
+        nx_mb: int,
+        nu: int,
+        alpha: float,
+        w_reg_weight: float,
+        w_soft_limits_weight: float,
+        w_limits: np.ndarray,
+        w_soft_limit_margin: float,
+        y_reg_weight: float,
+        y_reg_ref: np.ndarray,
+        y_reg_weights: np.ndarray,
+    ):
+        self.inner_model = inner_model
+        self.nx_mb = int(nx_mb)
+        self.nu_ctrl = int(nu)
+        self.alpha = float(np.clip(alpha, 0.0, 0.999999))
+        self.beta = 1.0 - self.alpha
+        self.w_reg_weight = float(max(w_reg_weight, 0.0))
+        self.w_soft_limits_weight = float(max(w_soft_limits_weight, 0.0))
+        self.w_limits = np.asarray(w_limits, dtype=float).reshape(self.nu_ctrl)
+        self.w_soft_limit_margin = float(max(w_soft_limit_margin, 0.0))
+        self._I = np.eye(self.nu_ctrl)
+        self.y_reg_weight = float(max(y_reg_weight, 0.0))
+        self.y_reg_ref = np.asarray(y_reg_ref, dtype=float).reshape(self.nx_mb + self.nu_ctrl)
+        self.y_reg_weights = np.asarray(y_reg_weights, dtype=float).reshape(self.nx_mb + self.nu_ctrl)
+        self._Wy2 = np.square(self.y_reg_weights)
+
+        state_aug = crocoddyl.StateVector(self.nx_mb + self.nu_ctrl)
+        super().__init__(state_aug, self.nu_ctrl, 1)
+        self.u_lb = -self.w_limits.copy()
+        self.u_ub = self.w_limits.copy()
+
+    def createData(self):
+        data = crocoddyl.ActionDataAbstract(self)
+        data.inner = self.inner_model.createData()
+        return data
+
+    def _soft_limit_terms(self, w: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+        lim = np.maximum(self.w_limits - self.w_soft_limit_margin, 1.0e-9)
+        abs_w = np.abs(w)
+        over = np.maximum(abs_w - lim, 0.0)
+        active = over > 0.0
+
+        # 0.5 * ||max(|w|-lim, 0)||^2
+        cost = 0.5 * float(np.dot(over, over))
+
+        grad = np.zeros(self.nu_ctrl, dtype=float)
+        grad[active] = over[active] * np.sign(w[active])
+
+        hess = np.zeros((self.nu_ctrl, self.nu_ctrl), dtype=float)
+        hess[np.diag_indices(self.nu_ctrl)] = active.astype(float)
+        return cost, grad, hess
+
+    def calc(self, data, x, u=None):
+        if u is None:
+            u = np.zeros(self.nu_ctrl, dtype=float)
+        x = np.asarray(x, dtype=float).reshape(self.state.nx)
+        w = np.asarray(u, dtype=float).reshape(self.nu_ctrl)
+
+        x_mb = x[: self.nx_mb]
+        tau = x[self.nx_mb :]
+
+        self.inner_model.calc(data.inner, x_mb, tau)
+
+        tau_next = self.alpha * tau + self.beta * w
+        data.xnext = np.concatenate([np.asarray(data.inner.xnext, dtype=float), tau_next])
+
+        cost = float(data.inner.cost)
+        if self.y_reg_weight > 0.0:
+            dy = x - self.y_reg_ref
+            cost += 0.5 * self.y_reg_weight * float(np.dot(self._Wy2 * dy, dy))
+        if self.w_reg_weight > 0.0:
+            cost += 0.5 * self.w_reg_weight * float(np.dot(w, w))
+        if self.w_soft_limits_weight > 0.0:
+            c_soft, _, _ = self._soft_limit_terms(w)
+            cost += self.w_soft_limits_weight * c_soft
+        data.cost = float(cost)
+
+    def calcDiff(self, data, x, u=None):
+        if u is None:
+            u = np.zeros(self.nu_ctrl, dtype=float)
+        x = np.asarray(x, dtype=float).reshape(self.state.nx)
+        w = np.asarray(u, dtype=float).reshape(self.nu_ctrl)
+
+        x_mb = x[: self.nx_mb]
+        tau = x[self.nx_mb :]
+
+        self.inner_model.calcDiff(data.inner, x_mb, tau)
+        inner = data.inner
+
+        nx_aug = self.state.nx
+        Fx = np.zeros((nx_aug, nx_aug), dtype=float)
+        Fu = np.zeros((nx_aug, self.nu_ctrl), dtype=float)
+
+        Fx[: self.nx_mb, : self.nx_mb] = np.asarray(inner.Fx, dtype=float)
+        Fx[: self.nx_mb, self.nx_mb :] = np.asarray(inner.Fu, dtype=float)
+        Fx[self.nx_mb :, self.nx_mb :] = self.alpha * self._I
+        Fu[self.nx_mb :, :] = self.beta * self._I
+
+        Lx = np.zeros(nx_aug, dtype=float)
+        Lu = np.zeros(self.nu_ctrl, dtype=float)
+        Lxx = np.zeros((nx_aug, nx_aug), dtype=float)
+        Luu = np.zeros((self.nu_ctrl, self.nu_ctrl), dtype=float)
+        Lxu = np.zeros((nx_aug, self.nu_ctrl), dtype=float)
+
+        Lx[: self.nx_mb] = np.asarray(inner.Lx, dtype=float)
+        Lx[self.nx_mb :] = np.asarray(inner.Lu, dtype=float)
+        Lxx[: self.nx_mb, : self.nx_mb] = np.asarray(inner.Lxx, dtype=float)
+        Lxx[: self.nx_mb, self.nx_mb :] = np.asarray(inner.Lxu, dtype=float)
+        Lxx[self.nx_mb :, : self.nx_mb] = np.asarray(inner.Lxu, dtype=float).T
+        Lxx[self.nx_mb :, self.nx_mb :] = np.asarray(inner.Luu, dtype=float)
+
+        if self.y_reg_weight > 0.0:
+            dy = x - self.y_reg_ref
+            Lx += self.y_reg_weight * (self._Wy2 * dy)
+            Lxx += self.y_reg_weight * np.diag(self._Wy2)
+
+        if self.w_reg_weight > 0.0:
+            Lu += self.w_reg_weight * w
+            Luu += self.w_reg_weight * self._I
+
+        if self.w_soft_limits_weight > 0.0:
+            _, g_soft, H_soft = self._soft_limit_terms(w)
+            Lu += self.w_soft_limits_weight * g_soft
+            Luu += self.w_soft_limits_weight * H_soft
+
+        data.Fx = Fx
+        data.Fu = Fu
+        data.Lx = Lx
+        data.Lu = Lu
+        data.Lxx = Lxx
+        data.Luu = Luu
+        data.Lxu = Lxu
 
 
 class ForceFeedbackCrocoddylMPC:
     """
-    Force-feedback EE MPC:
-      - Crocoddyl FDDP with free dynamics
-      - Two modes driven by trajectory/surface latch:
-        free-space approach and contact-plane circle tracking
-      - MuJoCo references are converted to Pinocchio world before building costs
-      - Uses measured torque state to compute commanded unfiltered torque from
-        the planned filtered torque policy (paper-inspired actuation augmentation)
+    Force-feedback EE MPC (paper-style augmented OCP):
+      - OCP state y = (q, v, tau_filtered)
+      - OCP control w = unfiltered torque
+      - Augmented LPF dynamics tau_{k+1} = alpha*tau_k + (1-alpha)*w_k
+      - Torque command sent to the robot follows the interpolated filtered-torque
+        policy (Eq. 14-18) using DDP Riccati gains
     """
 
     def __init__(
@@ -150,6 +317,9 @@ class ForceFeedbackCrocoddylMPC:
         self.data: pin.Data = self.model.createData()
         self.state = crocoddyl.StateMultibody(self.model)
         self.actuation = crocoddyl.ActuationModelFull(self.state)  # nu = nv
+        self.nx_mb = int(self.state.nx)
+        self.ndx_mb = int(self.state.ndx)
+        self.nx_aug = int(self.nx_mb + self.actuation.nu)
 
         # Pinocchio panda world differs from MuJoCo panda world by a fixed 180deg yaw.
         # p_mj = R_mj_from_pin @ p_pin
@@ -158,13 +328,14 @@ class ForceFeedbackCrocoddylMPC:
         obs0 = self.sim.get_observation(with_ee=True, with_jacobian=False)
         self.q_nom = np.asarray(obs0.q, dtype=float).copy()
         self.R_site_from_pin_ee = self._calibrate_site_rotation(obs0)
+        self.p_site_minus_frame_pin = self._calibrate_site_position_offset(obs0)
         self.R_des = self._rot_mj_to_pin(self._make_vertical_down_rotation_mj())
 
         self.xs: Optional[List[np.ndarray]] = None
         self.us: Optional[List[np.ndarray]] = None
         self.Ks: Optional[List[np.ndarray]] = None
-        self.ks: Optional[List[np.ndarray]] = None
-        self._tau_prev = np.asarray(obs0.tau_bias, dtype=float).copy()
+        self.ks: Optional[List[np.ndarray]] = None  # kept only for compatibility
+        self._tau_prev = np.asarray(obs0.tau_cmd, dtype=float).copy()
         self._last_solve_step = -1_000_000_000
         self._last_solve_ok = False
         self._last_solve_cost = np.nan
@@ -216,6 +387,20 @@ class ForceFeedbackCrocoddylMPC:
         # R_mj_site = R_mj_from_pin @ R_pin_ee @ R_site_from_pin_ee
         return R_pin_ee.T @ self.R_mj_from_pin.T @ R_mj_site
 
+    def _calibrate_site_position_offset(self, obs0) -> np.ndarray:
+        q0 = np.asarray(obs0.q, dtype=float)
+        pin.forwardKinematics(self.model, self.data, q0, np.zeros(self.model.nv))
+        pin.updateFramePlacements(self.model, self.data)
+        p_pin_ee = np.asarray(self.data.oMf[self.ee_fid].translation, dtype=float).copy()
+
+        if getattr(obs0, "ee_pos", None) is not None:
+            p_mj_site = np.asarray(obs0.ee_pos, dtype=float).reshape(3)
+        else:
+            p_mj_site = np.asarray(self.sim.data.site_xpos[self.sim.ee_site_id], dtype=float).reshape(3)
+
+        p_pin_site = self.R_mj_from_pin.T @ p_mj_site
+        return p_pin_site - p_pin_ee
+
     @staticmethod
     def _quat_wxyz_to_R(q: np.ndarray) -> np.ndarray:
         q = np.asarray(q, dtype=float).reshape(4)
@@ -240,7 +425,8 @@ class ForceFeedbackCrocoddylMPC:
         return np.column_stack([x, y, z])
 
     def _pos_mj_to_pin(self, p_mj: np.ndarray) -> np.ndarray:
-        return self.R_mj_from_pin.T @ np.asarray(p_mj, dtype=float)
+        # Map MuJoCo EE-site position target to the Pinocchio EE-frame target.
+        return self.R_mj_from_pin.T @ np.asarray(p_mj, dtype=float) - self.p_site_minus_frame_pin
 
     def _vel_mj_to_pin(self, v_mj: np.ndarray) -> np.ndarray:
         return self.R_mj_from_pin.T @ np.asarray(v_mj, dtype=float)
@@ -293,54 +479,70 @@ class ForceFeedbackCrocoddylMPC:
 
         return self._surface_latched
 
-    def _ff_alpha(self) -> float:
+    def _ff_alpha_ocp(self) -> float:
+        if self.cfg.ff_alpha_override is not None:
+            return float(np.clip(float(self.cfg.ff_alpha_override), 0.0, 0.999999))
+        wc = 2.0 * np.pi * float(max(self.cfg.ff_cutoff_hz, 0.0))
+        return float(np.clip(np.exp(-wc * float(self._dt_ocp)), 0.0, 0.999999))
+
+    def _ff_alpha_ctrl(self) -> float:
         if self.cfg.ff_alpha_override is not None:
             return float(np.clip(float(self.cfg.ff_alpha_override), 0.0, 0.999999))
         dt_mpc = float(getattr(self.sim, "dt", self.cfg.dt))
         wc = 2.0 * np.pi * float(max(self.cfg.ff_cutoff_hz, 0.0))
         return float(np.clip(np.exp(-wc * dt_mpc), 0.0, 0.999999))
 
+    def _policy_epsilon(self) -> float:
+        dt_mpc = float(getattr(self.sim, "dt", self.cfg.dt))
+        dt_ocp = float(self._dt_ocp)
+        # Eq. (14): epsilon = dt_mpc / dt_ocp, clipped in [0, 1].
+        return float(np.clip(dt_mpc / dt_ocp, 0.0, 1.0))
+
     def _tau_state_from_obs(self, obs) -> np.ndarray:
-        key = "tau_meas_filt" if bool(self.cfg.ff_use_tau_meas_filt) else "tau_meas"
-        tau = np.asarray(getattr(obs, key, np.zeros(self.actuation.nu)), dtype=float).reshape(self.actuation.nu)
-        if not np.all(np.isfinite(tau)):
-            tau = np.asarray(getattr(obs, "tau_meas", np.zeros(self.actuation.nu)), dtype=float).reshape(self.actuation.nu)
-        if not np.all(np.isfinite(tau)):
-            tau = np.zeros(self.actuation.nu, dtype=float)
-        return tau
+        src = str(self.cfg.ff_tau_state_source).strip().lower()
+        if src == "auto":
+            src = "tau_meas_filt" if bool(self.cfg.ff_use_tau_meas_filt) else "tau_meas"
 
-    def _force_feedback_torque(self, tau_des: np.ndarray, tau_state: np.ndarray) -> np.ndarray:
-        tau_des = np.asarray(tau_des, dtype=float).reshape(self.actuation.nu)
-        tau_state = np.asarray(tau_state, dtype=float).reshape(self.actuation.nu)
-        if not np.all(np.isfinite(tau_des)):
-            return self._tau_prev.copy()
+        key_candidates = {
+            "tau_meas_act_filt": ("tau_meas_act_filt", "tau_meas_act", "tau_cmd"),
+            "tau_meas_act": ("tau_meas_act", "tau_cmd"),
+            "tau_cmd": ("tau_cmd",),
+            "tau_meas_filt": ("tau_meas_filt", "tau_meas"),
+            "tau_meas": ("tau_meas",),
+            "tau_total": ("tau_total", "tau_meas"),
+        }.get(src, ("tau_meas_act_filt", "tau_meas_act", "tau_cmd", "tau_meas"))
 
-        gain = float(max(self.cfg.ff_tau_feedback_gain, 0.0))
-        if bool(self.cfg.ff_inverse_actuation_model):
-            alpha = self._ff_alpha()
-            denom = max(1.0e-6, 1.0 - alpha)
-            w_model = (tau_des - alpha * tau_state) / denom
-            tau_raw = tau_des + gain * (w_model - tau_des)
-        else:
-            tau_raw = tau_des + gain * (tau_des - tau_state)
+        for key in key_candidates:
+            if not hasattr(obs, key):
+                continue
+            tau = np.asarray(getattr(obs, key), dtype=float).reshape(self.actuation.nu)
+            if np.all(np.isfinite(tau)):
+                return tau
 
-        if not np.all(np.isfinite(tau_raw)):
-            return self._tau_prev.copy()
-        return tau_raw
+        tau = np.asarray(getattr(obs, "tau_cmd", np.zeros(self.actuation.nu)), dtype=float).reshape(self.actuation.nu)
+        if np.all(np.isfinite(tau)):
+            return tau
+        return np.zeros(self.actuation.nu, dtype=float)
+
+    def _tau_from_aug_state(self, y: np.ndarray) -> np.ndarray:
+        y = np.asarray(y, dtype=float).reshape(self.nx_aug)
+        return y[self.nx_mb : self.nx_mb + self.actuation.nu].copy()
 
     def compute_control(self, obs, t: float) -> np.ndarray:
         self._k += 1
 
         q = np.asarray(obs.q, dtype=float)
         v = np.asarray(obs.dq, dtype=float)
-        x0 = np.concatenate([q, v])
+        x_hat = np.concatenate([q, v])
+        tau_hat = self._tau_state_from_obs(obs)
+        y0 = np.concatenate([x_hat, tau_hat])
 
         _, _, surf_hint_now = self.traj_fn(t)
         phase_mode = str(self.cfg.phase_source).strip().lower()
         if phase_mode == "force_latch":
             surface_now = self._detect_surface(obs, t, surf_hint_now)
         else:
-            # Paper-faithful baseline: phase comes from task schedule, not measured force.
+            # Paper-mode schedule: contact phase is provided by the reference trajectory.
             surface_now = bool(surf_hint_now)
 
         if self._prev_surface_mode is None:
@@ -369,10 +571,8 @@ class ForceFeedbackCrocoddylMPC:
 
         if need_solve:
             # Build (or rebuild) the shooting problem for this MPC update.
-            problem = self._build_problem(t0=t, x0=x0, surface_now=surface_now)
+            problem = self._build_problem(t0=t, y0=y0, surface_now=surface_now)
 
-            # (Recommended) reuse solver object if possible
-            # Reuse solver if the Python API supports updating the problem; otherwise recreate it.
             if not hasattr(self, "_solver") or self._solver is None:
                 self._solver = self._make_solver(problem)
                 if self.cfg.verbose:
@@ -388,7 +588,7 @@ class ForceFeedbackCrocoddylMPC:
 
             solver = self._solver
             N = self.cfg.horizon
-            xs_init, us_init = self._shift_guess(x0, N)
+            xs_init, us_init = self._shift_guess(y0, N)
 
             ok = solver.solve(xs_init, us_init, self.cfg.max_iters, False)
             cost = float(getattr(solver, "cost", np.nan))
@@ -413,13 +613,16 @@ class ForceFeedbackCrocoddylMPC:
                         self.Ks = None
                     self.ks = None
 
-        tau_des, policy_idx = self._policy_control(x0)
-        tau_state = self._tau_state_from_obs(obs)
-        tau_raw = self._force_feedback_torque(tau_des, tau_state)
+        tau_des, policy_idx = self._policy_control(y0)
+        tau_raw = np.asarray(tau_des, dtype=float).copy()
+        if bool(self.cfg.ff_inverse_actuation_model):
+            alpha_ctrl = self._ff_alpha_ctrl()
+            beta_ctrl = max(1.0e-6, 1.0 - alpha_ctrl)
+            tau_raw = (tau_raw - alpha_ctrl * tau_hat) / beta_ctrl
 
         # Hard safety fallback if solver diverges numerically.
         tau_des_inf = float(np.max(np.abs(tau_des)))
-        tau_meas_state_inf = float(np.max(np.abs(tau_state)))
+        tau_meas_state_inf = float(np.max(np.abs(tau_hat)))
         tau_raw_inf = float(np.max(np.abs(tau_raw)))
         unstable = (not np.isfinite(cost)) or (cost > float(self.cfg.max_solver_cost)) or (
             tau_raw_inf > float(self.cfg.max_tau_raw_inf)
@@ -456,7 +659,7 @@ class ForceFeedbackCrocoddylMPC:
                 f"[MPC] t={t:6.3f} ok={ok} cost={cost:.2e} iters={iters:2d} "
                 f"|tau_des|∞={np.max(np.abs(tau_des)):.2f} "
                 f"|tau_raw|∞={np.max(np.abs(tau_raw)):.2f} |tau_cmd|∞={np.max(np.abs(tau_cmd)):.2f} "
-                f"|tau_state|∞={np.max(np.abs(tau_state)):.2f} "
+                f"|tau_state|∞={np.max(np.abs(tau_hat)):.2f} "
                 f"surf={int(surface_now)} fn={fn:.2f} fn_pred={fn_pred:.2f} ee_z={ee_z:.4f} "
                 f"solve={int(solved_now)} i={int(policy_idx)} unstable={int(unstable)}"
             )
@@ -492,6 +695,12 @@ class ForceFeedbackCrocoddylMPC:
             return self._gravity_torque(self.q_nom)
         # Default/paper-faithful: gravity centered at the current OCP linearization point.
         return self._gravity_torque(q_now)
+
+    def _compute_posture_reference(self, y0: np.ndarray) -> np.ndarray:
+        mode = str(self.cfg.posture_ref_mode).strip().lower()
+        if mode == "x0":
+            return np.asarray(y0[: self.nx_mb], dtype=float).copy()
+        return np.concatenate([self.q_nom, np.zeros(self.model.nv, dtype=float)])
 
     def _make_control_residual(self, u_ref: np.ndarray):
         u_ref = np.asarray(u_ref, dtype=float).reshape(self.actuation.nu)
@@ -546,9 +755,33 @@ class ForceFeedbackCrocoddylMPC:
         activation = crocoddyl.ActivationModelQuadraticBarrier(crocoddyl.ActivationBounds(lb, ub, 1.0))
         return crocoddyl.CostModelResidual(self.state, activation, residual)
 
-    def _build_problem(self, t0: float, x0: np.ndarray, surface_now: bool) -> crocoddyl.ShootingProblem:
+    def _build_problem(self, t0: float, y0: np.ndarray, surface_now: bool) -> crocoddyl.ShootingProblem:
         dt_ocp = self._dt_ocp
-        tau_ref = self._compute_tau_reference(x0[: self.model.nq])
+        alpha = self._ff_alpha_ocp()
+        tau_ref = self._compute_tau_reference(y0[: self.model.nq])
+        x_reg_ref = self._compute_posture_reference(y0)
+        tau_limits = np.asarray(self.cfg.tau_limits, dtype=float)
+        y_ref = np.asarray(y0, dtype=float).reshape(self.nx_aug)
+        wy_q = np.asarray(self.cfg.y_q_weights, dtype=float).reshape(self.model.nq)
+        wy_v = np.asarray(self.cfg.y_v_weights, dtype=float).reshape(self.model.nv)
+        wy_tau = np.asarray(self.cfg.y_tau_weights, dtype=float).reshape(self.actuation.nu)
+        y_reg_weights = np.concatenate([wy_q, wy_v, wy_tau])
+
+        def _wrap(inner_model):
+            return _AugmentedLPFActionModel(
+                inner_model=inner_model,
+                nx_mb=self.nx_mb,
+                nu=self.actuation.nu,
+                alpha=alpha,
+                w_reg_weight=float(self.cfg.w_w),
+                w_soft_limits_weight=float(self.cfg.w_w_soft_limits),
+                w_limits=tau_limits,
+                w_soft_limit_margin=float(self.cfg.tau_soft_limit_margin),
+                y_reg_weight=float(self.cfg.w_y),
+                y_reg_ref=y_ref,
+                y_reg_weights=y_reg_weights,
+            )
+
         running = []
         for k in range(self.cfg.horizon):
             tk = t0 + k * dt_ocp
@@ -564,8 +797,10 @@ class ForceFeedbackCrocoddylMPC:
                 surface_mode=surf_k,
                 terminal=False,
                 tau_ref=tau_ref,
+                x_reg_ref=x_reg_ref,
             )
-            running.append(crocoddyl.IntegratedActionModelEuler(dam, dt_ocp))
+            inner = crocoddyl.IntegratedActionModelEuler(dam, dt_ocp)
+            running.append(_wrap(inner))
 
         pT_mj, vT_mj, _ = self.traj_fn(t0 + self.cfg.horizon * dt_ocp)
         pT_pin = self._pos_mj_to_pin(np.asarray(pT_mj, dtype=float))
@@ -576,9 +811,11 @@ class ForceFeedbackCrocoddylMPC:
             surface_mode=bool(surface_now),
             terminal=True,
             tau_ref=tau_ref,
+            x_reg_ref=x_reg_ref,
         )
-        terminal = crocoddyl.IntegratedActionModelEuler(terminal_dam, dt_ocp)
-        return crocoddyl.ShootingProblem(x0, running, terminal)
+        terminal_inner = crocoddyl.IntegratedActionModelEuler(terminal_dam, dt_ocp)
+        terminal = _wrap(terminal_inner)
+        return crocoddyl.ShootingProblem(np.asarray(y0, dtype=float), running, terminal)
 
     def _make_dam(
         self,
@@ -587,20 +824,22 @@ class ForceFeedbackCrocoddylMPC:
         surface_mode: bool,
         terminal: bool,
         tau_ref: np.ndarray,
+        x_reg_ref: np.ndarray,
     ):
         costs = crocoddyl.CostModelSum(self.state, self.actuation.nu)
 
-        # --- common posture + velocity damping (keep your structure) ---
-        x_ref = np.concatenate([self.q_nom, np.zeros(self.model.nv)])
-        r_x = crocoddyl.ResidualModelState(self.state, x_ref, self.actuation.nu)
-        costs.addCost("posture", crocoddyl.CostModelResidual(self.state, r_x), self.cfg.w_posture)
+        # Optional inner-model regularization kept for fallback/ablation.
+        if bool(self.cfg.use_inner_state_reg):
+            x_ref = np.asarray(x_reg_ref, dtype=float).reshape(self.nx_mb)
+            r_x = crocoddyl.ResidualModelState(self.state, x_ref, self.actuation.nu)
+            costs.addCost("posture", crocoddyl.CostModelResidual(self.state, r_x), self.cfg.w_posture)
 
-        x_zero = np.zeros(self.model.nq + self.model.nv)
-        r_v = crocoddyl.ResidualModelState(self.state, x_zero, self.actuation.nu)
-        act_v = crocoddyl.ActivationModelWeightedQuad(
-            np.concatenate([np.zeros(self.model.nq), np.asarray(self.cfg.v_damp_weights, dtype=float)])
-        )
-        costs.addCost("v_damp", crocoddyl.CostModelResidual(self.state, act_v, r_v), self.cfg.w_v)
+            x_zero = np.zeros(self.model.nq + self.model.nv)
+            r_v = crocoddyl.ResidualModelState(self.state, x_zero, self.actuation.nu)
+            act_v = crocoddyl.ActivationModelWeightedQuad(
+                np.concatenate([np.zeros(self.model.nq), np.asarray(self.cfg.v_damp_weights, dtype=float)])
+            )
+            costs.addCost("v_damp", crocoddyl.CostModelResidual(self.state, act_v, r_v), self.cfg.w_v)
 
         if self.cfg.w_q_soft_limits > 0.0:
             costs.addCost("q_soft_limits", self._make_q_soft_limit_cost(), self.cfg.w_q_soft_limits)
@@ -619,7 +858,7 @@ class ForceFeedbackCrocoddylMPC:
         act_w = crocoddyl.ActivationModelWeightedQuad(np.array([0.0, 0.0, 0.0, ww[0], ww[1], ww[2]], dtype=float))
         costs.addCost("w_damp", crocoddyl.CostModelResidual(self.state, act_w, r_w), self.cfg.w_wdamp)
 
-        if not terminal:
+        if (not terminal) and bool(self.cfg.use_inner_tau_reg):
             r_tau = self._make_control_residual(np.asarray(tau_ref, dtype=float))
             costs.addCost("tau_reg", crocoddyl.CostModelResidual(self.state, r_tau), self.cfg.w_tau)
 
@@ -637,7 +876,7 @@ class ForceFeedbackCrocoddylMPC:
         # ===========================
         if not surface_mode:
             r_pos = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.actuation.nu)
-            act_pos = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 1.5], dtype=float))
+            act_pos = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 2.5], dtype=float))
             costs.addCost("ee_pos", crocoddyl.CostModelResidual(self.state, act_pos, r_pos), self.cfg.w_ee_pos)
 
             dam = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, costs)
@@ -724,7 +963,7 @@ class ForceFeedbackCrocoddylMPC:
             act_uni = crocoddyl.ActivationModelQuadraticBarrier(crocoddyl.ActivationBounds(lb_uni, ub_uni, 1.0))
             costs.addCost("unilateral", crocoddyl.CostModelResidual(self.state, act_uni, r_f0), self.cfg.w_unilateral)
 
-        # Classical baseline normal-force objective (predicted force, no feedback injection).
+        # Predicted normal-force objective in the augmented OCP.
         if self.cfg.w_fn > 0.0:
             if nc == 1:
                 r_fn = self._make_contact_force_residual(
@@ -753,22 +992,23 @@ class ForceFeedbackCrocoddylMPC:
 
 
     
-    def _shift_guess(self, x0: np.ndarray, N: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    def _shift_guess(self, y0: np.ndarray, N: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
         """
         Proper receding-horizon warm start:
-        xs_init = [x0] + xs_prev[1:] (clipped to horizon)
+        xs_init = [y0] + xs_prev[1:] (clipped to horizon)
         us_init = us_prev[1:] + [us_prev[-1]]
-        Falls back to holding x0 / tau_prev if no previous solution.
+        Falls back to holding y0 / tau_state if no previous solution.
         """
         if self.xs is None or self.us is None or len(self.us) < N:
-            xs_init = [x0.copy() for _ in range(N + 1)]
-            us_init = [self._tau_prev.copy() for _ in range(N)]
+            xs_init = [y0.copy() for _ in range(N + 1)]
+            tau0 = self._tau_from_aug_state(y0)
+            us_init = [tau0.copy() for _ in range(N)]
             return xs_init, us_init
 
         xs_prev = self.xs
         us_prev = self.us
 
-        xs_init = [x0.copy()]
+        xs_init = [y0.copy()]
         xs_init += [xs_prev[i].copy() for i in range(1, min(len(xs_prev), N + 1))]
         while len(xs_init) < (N + 1):
             xs_init.append(xs_prev[-1].copy())
@@ -779,40 +1019,59 @@ class ForceFeedbackCrocoddylMPC:
 
         return xs_init, us_init
 
-    def _policy_control(self, x_now: np.ndarray) -> tuple[np.ndarray, int]:
-        if self.us is None or len(self.us) == 0:
-            return self._tau_prev.copy(), -1
+    def _policy_control(self, y_now: np.ndarray) -> tuple[np.ndarray, int]:
+        if self.us is None or self.xs is None or len(self.us) == 0 or len(self.xs) == 0:
+            return self._tau_from_aug_state(y_now), -1
 
         i = 0
-        u = np.asarray(self.us[i], dtype=float).copy()
-        # Eq. (14)-style interpolation is only needed when control is faster than
-        # OCP knot spacing. If dt_mpc == dt_ocp, keep tau_0*.
-        if (
-            bool(self.cfg.ff_use_tau_interpolation)
-            and len(self.us) > 1
-            and float(self.cfg.dt) < float(self._dt_ocp) - 1.0e-9
-        ):
-            eps = float(np.clip(float(self.cfg.dt) / float(self._dt_ocp), 0.0, 1.0))
-            u = u + eps * (np.asarray(self.us[1], dtype=float) - u)
+        nu = self.actuation.nu
+        alpha = self._ff_alpha_ocp()
+        eps = self._policy_epsilon() if bool(self.cfg.ff_use_tau_interpolation) else 0.0
 
-        # Use the solved nominal control plus local state feedback.
-        # Do not add solver.k here: solver.us is already the optimized nominal sequence.
+        y0_nom = np.asarray(self.xs[i], dtype=float)
+        tau0 = self._tau_from_aug_state(y0_nom)
 
+        if len(self.xs) > (i + 1):
+            tau1 = self._tau_from_aug_state(self.xs[i + 1])
+        else:
+            w0 = np.asarray(self.us[i], dtype=float).reshape(nu)
+            tau1 = alpha * tau0 + (1.0 - alpha) * w0
+
+        # Eq. (14): interpolated filtered torque reference.
+        tau_tilde = tau0 + eps * (tau1 - tau0)
+        tau_cmd = tau_tilde.copy()
+
+        # Eq. (15-18): feedback on interpolated policy using DDP gains.
         if (
             self.cfg.use_feedback_policy
             and self.Ks is not None
-            and self.xs is not None
             and i < len(self.Ks)
-            and i < len(self.xs)
         ):
-            try:
-                dx = self.state.diff(x_now, self.xs[i])
-            except Exception:
-                dx = np.asarray(x_now - self.xs[i], dtype=float)
-            K = np.asarray(self.Ks[i], dtype=float)
-            u += float(self.cfg.feedback_gain_scale) * (K @ dx)
+            K0 = np.asarray(self.Ks[i], dtype=float)
+            if K0.ndim == 1:
+                K0 = K0.reshape(1, -1)
+            if K0.shape[1] >= self.nx_aug:
+                K_aug = K0[:, : self.nx_aug]
+                Kx = K_aug[:, : self.nx_mb]
+                Ktau = K_aug[:, self.nx_mb : self.nx_mb + nu]
 
-        return u, i
+                x_err = np.asarray(y0_nom[: self.nx_mb] - y_now[: self.nx_mb], dtype=float)
+                tau_err = np.asarray(tau0 - y_now[self.nx_mb : self.nx_mb + nu], dtype=float)
+
+                K_tilde_x = eps * (1.0 - alpha) * Kx
+                K_tilde_tau = np.eye(nu) + eps * (1.0 - alpha) * (Ktau - np.eye(nu))
+                tau_cmd += float(self.cfg.feedback_gain_scale) * (
+                    K_tilde_x @ x_err + K_tilde_tau @ tau_err
+                )
+            else:
+                # Fallback: if gain dimensions differ across bindings, skip feedback
+                # rather than mixing inconsistent policy dimensions.
+                self._warn_once(
+                    "ff_policy_gain_dim",
+                    f"FF policy gain shape {K0.shape} is incompatible with ndx_aug={self.ndx_mb + nu}; using interpolation only.",
+                )
+
+        return np.asarray(tau_cmd, dtype=float).reshape(nu), i
     
     def _make_contact_friction_residual(self, contact_id: int, cone):
         try:
@@ -944,6 +1203,8 @@ class ForceFeedbackCrocoddylMPC:
                 return np.nan
 
             rd0 = problem.runningDatas[0]
+            if hasattr(rd0, "inner"):
+                rd0 = rd0.inner
             dd0 = getattr(rd0, "differential", None)
             if dd0 is None:
                 return np.nan
@@ -962,13 +1223,27 @@ class ForceFeedbackCrocoddylMPC:
                 return np.nan
 
             f_obj = cdata.f
+            contact_mode = str(self.cfg.contact_model).strip().lower()
+
+            # For 1D contact, prefer scalar representation if present.
+            f_arr = np.asarray(f_obj, dtype=float).reshape(-1)
+            if contact_mode in ("normal_1d", "1d", "normal1d"):
+                if f_arr.size == 1:
+                    return float(f_arr[0])
+                if hasattr(f_obj, "linear"):
+                    f_lin = np.asarray(f_obj.linear, dtype=float).reshape(-1)
+                    if f_lin.size >= 3:
+                        return float(f_lin[2])
+                if f_arr.size > 0:
+                    return float(f_arr[0])
+                return np.nan
+
             if hasattr(f_obj, "linear"):
                 f_lin = np.asarray(f_obj.linear, dtype=float).reshape(-1)
                 if f_lin.size >= 3:
                     # Contact normal is world +z in LOCAL_WORLD_ALIGNED for the table task.
                     return float(f_lin[2])
 
-            f_arr = np.asarray(f_obj, dtype=float).reshape(-1)
             if f_arr.size == 1:
                 return float(f_arr[0])
             if f_arr.size >= 3:

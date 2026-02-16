@@ -10,12 +10,25 @@ import numpy as np
 import pinocchio as pin
 
 from src.mpc.crocoddyl_classical import ClassicalCrocoddylMPC, ClassicalMPCConfig
+from src.run.paper_uncertainty import PaperUncertaintyInjector, config_for_scenario
 from src.sim.franka_sim import FrankaMujocoSim
 from src.tasks.trajectories import make_approach_then_circle
 from src.utils.logging import RunLogger
 
 SCENE = Path("assets/scenes/panda_table_scene.xml")
 SCENARIOS = ("flat", "tilted_5", "tilted_10", "tilted_15", "actuation_uncertainty")
+
+
+def _scenario_seed(name: str) -> int:
+    seeds = {
+        "flat": 11,
+        "tilted_5": 12,
+        "tilted_10": 13,
+        "tilted_15": 14,
+        "actuation_uncertainty": 15,
+        "tilted": 16,
+    }
+    return int(seeds.get(name, 99))
 
 
 def _table_geometry_world(sim: FrankaMujocoSim):
@@ -187,7 +200,8 @@ def _check_pin_mj_alignment(sim: FrankaMujocoSim, mpc: ClassicalCrocoddylMPC, sa
             pin.forwardKinematics(mpc.model, mpc.data, q, np.zeros(mpc.model.nv))
             pin.updateFramePlacements(mpc.model, mpc.data)
             oMf = mpc.data.oMf[mpc.ee_fid]
-            p_mj_pred = mpc.R_mj_from_pin @ oMf.translation
+            p_off = np.asarray(getattr(mpc, "p_site_minus_frame_pin", np.zeros(3, dtype=float)), dtype=float)
+            p_mj_pred = mpc.R_mj_from_pin @ (oMf.translation + p_off)
             R_mj_pred = mpc.R_mj_from_pin @ oMf.rotation @ mpc.R_site_from_pin_ee
 
             pos_errs.append(float(np.linalg.norm(p_mj - p_mj_pred)))
@@ -222,6 +236,10 @@ def _run_single(
     mpc_iters: Optional[int],
     use_command_filter: bool,
     align_check_samples: int,
+    circle_radius: float,
+    circle_omega: float,
+    phase_source: str,
+    paper_mode: bool,
 ) -> dict:
     settings = _scenario_settings(scenario)
 
@@ -230,6 +248,10 @@ def _run_single(
     print("=" * 80)
 
     sim = FrankaMujocoSim(SCENE, command_type="torque", n_substeps=5)
+    if paper_mode:
+        # Paper protocol uses a 1 kHz physics loop.
+        sim.model.opt.timestep = 0.001
+        mujoco.mj_forward(sim.model, sim.data)
     obs = sim.reset("neutral")
     # Build the controller references from the nominal flat geometry first.
     # For disturbed scenarios, the world is tilted afterwards (unknown to the controller model).
@@ -238,85 +260,152 @@ def _run_single(
     print(f"Simulation initialized (dt={sim.dt:.4f}s)")
     print(f"Initial EE position: {obs.ee_pos}")
     print(f"Scenario: {settings['label']}")
-    print(f"Contact model: {contact_model} | command_filter={int(use_command_filter)}")
+    print(
+        f"Contact model: {contact_model} | command_filter={int(use_command_filter)} | "
+        f"phase_source={phase_source} | paper_mode={int(bool(paper_mode))}"
+    )
 
     _, table_center, table_half, z_table_top = _table_geometry_world(sim)
     r_tool = float(sim.model.geom_size[sim.ee_geom_id][0])
-    z_contact = z_table_top + r_tool + 2.0e-4
-    z_pre = z_contact + 0.08
+    z_contact_offset = -1.0e-2 if paper_mode else 2.0e-4
+    z_contact = z_table_top + r_tool + z_contact_offset
+    z_pre = z_contact + (0.05 if paper_mode else 0.08)
 
-    # Requested benchmark: large-radius circle centered at the table center.
-    radius = 0.10
-    omega = 0.14
+    radius = float(circle_radius)
+    omega = float(circle_omega)
     center = np.array([table_center[0], table_center[1], z_contact], dtype=float)
 
     print(f"Table top (world): center={table_center}, half-size={table_half}, z_top={z_table_top:.4f}m")
     print(f"Contact target: z_contact={z_contact:.4f}m (tool radius={r_tool:.4f}m)")
     print(f"Circle center (table center): {center}, radius={radius:.3f}m")
 
-    traj = make_approach_then_circle(
+    t_approach = 3.0 if paper_mode else 1.4
+    t_pre = 2.0 if paper_mode else 1.4
+    traj_base = make_approach_then_circle(
         center=center,
         radius=radius,
         omega=omega,
         z_pre=z_pre,
         z_contact=z_contact,
-        t_approach=2.0,
+        t_approach=t_approach,
         ee_start=obs.ee_pos.copy(),
-        t_pre=2.2,
+        t_pre=t_pre,
     )
-    t_contact_phase = 4.2
+    t_contact_phase = float(t_pre + t_approach)
+    t_contact_stabilize = 0.8 if paper_mode else 0.0
+
+    def traj(t_query: float):
+        p_ref, v_ref, surf_ref = traj_base(t_query)
+        if surf_ref and (float(t_query) < (t_contact_phase + t_contact_stabilize)):
+            p_hold, _, _ = traj_base(t_contact_phase)
+            return np.asarray(p_hold, dtype=float), np.zeros(3, dtype=float), True
+        return p_ref, v_ref, surf_ref
+
     print("Trajectory generated (approach + circle)")
 
-    max_iters = int(mpc_iters) if mpc_iters is not None else (5 if paper_budget else 55)
+    if mpc_iters is not None:
+        max_iters = int(mpc_iters)
+    elif paper_mode:
+        max_iters = 5
+    else:
+        max_iters = 3 if paper_budget else 10
     print(
         f"MPC budget: max_iters={max_iters} "
-        f"({'paper budget' if paper_budget and mpc_iters is None else 'custom/dev'})"
+        f"({'paper mode default' if (paper_mode and mpc_iters is None) else ('paper budget' if paper_budget and mpc_iters is None else 'custom/dev')})"
     )
-
-    cfg = ClassicalMPCConfig(
-        horizon=30,
-        dt=sim.dt,
-        dt_ocp=sim.dt,
-        z_contact=z_contact,
-        z_press=0.0095,
-        w_ee_pos=8.0e2,
-        w_ee_ori=8.0e1,
-        ori_weights=np.array([2.5, 2.5, 0.1], dtype=float),
-        w_posture=2.0e-1,
-        w_v=2.0e-1,
-        w_tau=1.0e-3,
-        torque_ref_mode="gravity_x0",
-        w_tau_soft_limits=2.0,
-        w_q_soft_limits=12.0,
-        q_soft_limit_margin=0.08,
-        w_tau_smooth=5.0e-2,
-        w_tangent_pos=3.1e3,
-        w_tangent_vel=1.0e3,
-        w_plane_z=0.0,
-        w_vz=0.0,
-        w_friction_cone=0.0,
-        w_unilateral=2.0e1,
-        mu=1.0,
-        contact_gains=np.array([82.0, 45.0], dtype=float),
-        fn_des=28.5,
-        w_fn=2.85e1,
-        w_wdamp=6.0e1,
-        w_wdamp_weights=np.array([1.6, 1.6, 0.2], dtype=float),
-        fn_contact_on=1.0,
-        fn_contact_off=0.05,
-        z_contact_band=0.012,
-        max_iters=max_iters,
-        mpc_update_steps=1,
-        use_feedback_policy=True,
-        feedback_gain_scale=0.12,
-        max_tau_raw_inf=1.5e2,
-        contact_release_steps=180,
-        contact_model=contact_model,
-        phase_source="trajectory",
-        apply_command_filter=use_command_filter,
-        strict_force_residual_dim=True,
-        debug_every=100,
-    )
+    if paper_mode:
+        cfg = ClassicalMPCConfig(
+            horizon=50,
+            dt=sim.dt,
+            dt_ocp=0.02,
+            z_contact=z_contact,
+            z_press=0.0,
+            w_ee_pos=2.0e2,
+            w_ee_ori=1.0e2,
+            ori_weights=np.array([1.0, 1.0, 0.2], dtype=float),
+            w_posture=2.0e-1,
+            w_v=5.0e-2,
+            posture_ref_mode="q_nom",
+            w_tau=5.0e-4,
+            torque_ref_mode="gravity_x0",
+            w_tau_soft_limits=0.0,
+            w_q_soft_limits=5.0,
+            q_soft_limit_margin=0.05,
+            w_tau_smooth=0.0,
+            w_tangent_pos=2.0e2,
+            w_tangent_vel=0.0,
+            w_plane_z=2.0e2,
+            w_vz=0.0,
+            w_friction_cone=0.0,
+            w_unilateral=2.0,
+            mu=1.0,
+            contact_gains=np.array([0.0, 60.0], dtype=float),
+            fn_des=20.0,
+            w_fn=1.0e1,
+            w_wdamp=0.0,
+            w_wdamp_weights=np.array([1.0, 1.0, 0.2], dtype=float),
+            fn_contact_on=0.2,
+            fn_contact_off=0.05,
+            z_contact_band=0.02,
+            max_iters=max_iters,
+            mpc_update_steps=1,
+            use_feedback_policy=True,
+            feedback_gain_scale=1.0,
+            max_solver_cost=1.0e8,
+            max_tau_raw_inf=3.0e2,
+            contact_release_steps=80,
+            contact_model="normal_1d",
+            phase_source="force_latch",
+            apply_command_filter=False,
+            strict_force_residual_dim=True,
+            debug_every=100,
+        )
+    else:
+        cfg = ClassicalMPCConfig(
+            horizon=50,
+            dt=sim.dt,
+            dt_ocp=0.01,
+            z_contact=z_contact,
+            z_press=0.0075,
+            w_ee_pos=1.3e3,
+            w_ee_ori=6.0e1,
+            ori_weights=np.array([2.4, 2.4, 0.2], dtype=float),
+            w_posture=1.5e-1,
+            w_v=8.0e-2,
+            posture_ref_mode="q_nom",
+            w_tau=2.0e-3,
+            torque_ref_mode="gravity_x0",
+            w_tau_soft_limits=4.0,
+            w_q_soft_limits=10.0,
+            q_soft_limit_margin=0.10,
+            w_tau_smooth=5.0e-2,
+            w_tangent_pos=3.5e3,
+            w_tangent_vel=1.3e3,
+            w_plane_z=6.0e2,
+            w_vz=2.5e2,
+            w_friction_cone=0.0,
+            w_unilateral=4.0e1,
+            mu=1.0,
+            contact_gains=np.array([150.0, 85.0], dtype=float),
+            fn_des=30.0,
+            w_fn=5.5e1,
+            w_wdamp=8.0e1,
+            w_wdamp_weights=np.array([2.0, 2.0, 0.3], dtype=float),
+            fn_contact_on=1.0,
+            fn_contact_off=0.05,
+            z_contact_band=0.012,
+            max_iters=max_iters,
+            mpc_update_steps=1,
+            use_feedback_policy=True,
+            feedback_gain_scale=0.60,
+            max_tau_raw_inf=2.0e2,
+            contact_release_steps=80,
+            contact_model=contact_model,
+            phase_source=phase_source,
+            apply_command_filter=use_command_filter,
+            strict_force_residual_dim=True,
+            debug_every=100,
+        )
     print("MPC config created")
 
     mpc = ClassicalCrocoddylMPC(sim=sim, traj_fn=traj, config=cfg)
@@ -339,6 +428,26 @@ def _run_single(
             f"Applied hidden table tilt: {settings['tilt_deg']:.1f} deg "
             "(controller references remain from nominal flat table)."
         )
+
+    uncertainty = None
+    uncertainty_meta = None
+    if paper_mode:
+        unc_cfg = config_for_scenario(scenario, seed=_scenario_seed(scenario))
+        if unc_cfg is not None:
+            uncertainty = PaperUncertaintyInjector(
+                dt=float(sim.dt),
+                nu=7,
+                config=unc_cfg,
+                tau_lpf_alpha=float(sim.tau_meas_lpf_alpha),
+            )
+            uncertainty_meta = uncertainty.meta()
+            print(
+                "Paper uncertainty enabled: "
+                f"a=[{unc_cfg.a_min:.3f},{unc_cfg.a_max:.3f}] "
+                f"b=[{unc_cfg.b_min:.3f},{unc_cfg.b_max:.3f}] "
+                f"obs_delay={unc_cfg.delta_obs_cycles} "
+                f"cmd_delay={unc_cfg.delta_cmd_s*1e3:.2f}ms"
+            )
 
     logger = RunLogger(
         run_name=f"classical_{scenario}",
@@ -365,8 +474,12 @@ def _run_single(
     torque_scale = settings["torque_scale"]
 
     def _step_once(k: int, t_now: float, obs_now):
-        tau_cmd = mpc.compute_control(obs_now, t_now)
-        tau_applied = tau_cmd * torque_scale
+        ctrl_obs = uncertainty.observation_for_controller(obs_now) if uncertainty is not None else obs_now
+        tau_cmd = mpc.compute_control(ctrl_obs, t_now)
+        if uncertainty is not None:
+            tau_applied = uncertainty.command_for_plant(tau_cmd)
+        else:
+            tau_applied = tau_cmd * torque_scale
         obs_next = sim.step(tau_applied)
         t_next = t_now + sim.dt
 
@@ -458,6 +571,8 @@ def _run_single(
     rms_tan = float(np.sqrt(np.mean(err_tan_arr ** 2))) if err_tan_arr.size > 0 else np.nan
     rms_3d = float(np.sqrt(np.mean(err_3d_arr ** 2))) if err_3d_arr.size > 0 else np.nan
     rms_tan_phase = float(np.sqrt(np.mean(err_tan_phase ** 2))) if err_tan_phase.size > 0 else np.nan
+    avg_abs_pos_err = float(np.mean(np.abs(err_tan_arr))) if err_tan_arr.size > 0 else np.nan
+    avg_abs_force_err = float(np.mean(np.abs(fn_meas_arr - float(cfg.fn_des)))) if fn_meas_arr.size > 0 else np.nan
     max_fn = float(np.max(fn_meas_arr)) if fn_meas_arr.size > 0 else np.nan
     contact_loss_pct = float((1.0 - np.mean(contact_arr)) * 100.0) if contact_arr.size > 0 else np.nan
     contact_loss_phase_pct = (
@@ -472,9 +587,14 @@ def _run_single(
         scenario_tilt_deg=float(settings["tilt_deg"]),
         tau_meas_definition="tau_total = tau_cmd + tau_act + tau_constraint",
         fn_pred_definition="Predicted normal-force variable in the OCP contact model (may not equal physical table-normal force under tilt mismatch).",
+        contact_definition="in_contact = (fn_meas > 0.5 N)",
         tau_meas_lpf_alpha=float(sim.tau_meas_lpf_alpha),
+        paper_mode=bool(paper_mode),
+        paper_uncertainty=uncertainty_meta,
         torque_scale=np.asarray(torque_scale, dtype=float),
         fn_des=float(cfg.fn_des),
+        avg_abs_position_err=avg_abs_pos_err,
+        avg_abs_force_err=avg_abs_force_err,
         rms_tangential_error=rms_tan,
         rms_tangential_error_contact_phase=rms_tan_phase,
         rms_3d_error=rms_3d,
@@ -491,6 +611,8 @@ def _run_single(
             "z_press": float(cfg.z_press),
             "w_fn": float(cfg.w_fn),
             "fn_des": float(cfg.fn_des),
+            "circle_radius": float(radius),
+            "circle_omega": float(omega),
             "contact_model": str(cfg.contact_model),
             "w_friction_cone": float(cfg.w_friction_cone),
             "w_unilateral": float(cfg.w_unilateral),
@@ -514,7 +636,9 @@ def _run_single(
     print("\nSummary statistics:")
     print(f"  RMS tangential error: {rms_tan:.4f} m")
     print(f"  RMS tangential error (contact phase): {rms_tan_phase:.4f} m")
+    print(f"  Avg abs. tangential error: {avg_abs_pos_err:.4f} m")
     print(f"  RMS 3D tracking error: {rms_3d:.4f} m")
+    print(f"  Avg abs. force error: {avg_abs_force_err:.2f} N")
     print(f"  Fn_meas: min={fn_meas_arr.min():.2f}N, max={fn_meas_arr.max():.2f}N, mean={fn_meas_arr.mean():.2f}N")
     print(f"  Fn_meas (contact phase mean): {fn_mean_phase:.2f}N")
     if np.isfinite(fn_pred_arr).any():
@@ -528,6 +652,8 @@ def _run_single(
 
     return {
         "scenario": scenario,
+        "avg_abs_pos_err": avg_abs_pos_err,
+        "avg_abs_force_err": avg_abs_force_err,
         "rms_tan": rms_tan,
         "rms_3d": rms_3d,
         "max_fn": max_fn,
@@ -549,6 +675,10 @@ def main(
     mpc_iters: Optional[int],
     use_command_filter: bool,
     align_check_samples: int,
+    circle_radius: float,
+    circle_omega: float,
+    phase_source: str,
+    paper_mode: bool,
 ):
     if all_scenarios:
         if not no_viewer:
@@ -567,6 +697,10 @@ def main(
                     mpc_iters=mpc_iters,
                     use_command_filter=use_command_filter,
                     align_check_samples=align_check_samples,
+                    circle_radius=circle_radius,
+                    circle_omega=circle_omega,
+                    phase_source=phase_source,
+                    paper_mode=paper_mode,
                 )
             )
 
@@ -595,6 +729,10 @@ def main(
         mpc_iters=mpc_iters,
         use_command_filter=use_command_filter,
         align_check_samples=align_check_samples,
+        circle_radius=circle_radius,
+        circle_omega=circle_omega,
+        phase_source=phase_source,
+        paper_mode=paper_mode,
     )
 
 
@@ -618,6 +756,8 @@ if __name__ == "__main__":
     parser.add_argument("--contact-model", choices=("normal_1d", "point3d"), default="normal_1d")
     parser.add_argument("--paper-budget", action="store_true", help="Use paper-like small DDP iteration budget.")
     parser.add_argument("--mpc-iters", type=int, default=None, help="Override DDP max iterations per MPC solve.")
+    parser.add_argument("--circle-radius", type=float, default=0.10, help="Circle radius [m].")
+    parser.add_argument("--circle-omega", type=float, default=1.5, help="Circle angular velocity [rad/s].")
     parser.add_argument(
         "--use-command-filter",
         action="store_true",
@@ -629,6 +769,25 @@ if __name__ == "__main__":
         default=16,
         help="Number of random q samples for MuJoCo↔Pinocchio EE alignment check (0 disables).",
     )
+    parser.add_argument(
+        "--phase-source",
+        choices=("trajectory", "force_latch"),
+        default="trajectory",
+        help="Contact phase selection mode.",
+    )
+    parser.add_argument(
+        "--paper-mode",
+        dest="paper_mode",
+        action="store_true",
+        help="Enable strict paper-mode protocol (default).",
+    )
+    parser.add_argument(
+        "--no-paper-mode",
+        dest="paper_mode",
+        action="store_false",
+        help="Disable strict paper-mode protocol and use development settings.",
+    )
+    parser.set_defaults(paper_mode=True)
     args = parser.parse_args()
 
     main(
@@ -643,4 +802,8 @@ if __name__ == "__main__":
         mpc_iters=args.mpc_iters,
         use_command_filter=args.use_command_filter,
         align_check_samples=args.align_check_samples,
+        circle_radius=args.circle_radius,
+        circle_omega=args.circle_omega,
+        phase_source=args.phase_source,
+        paper_mode=args.paper_mode,
     )

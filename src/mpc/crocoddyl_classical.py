@@ -27,14 +27,18 @@ class ClassicalMPCConfig:
     w_v: float = 2.5e-1
     w_tau: float = 1.0e-3
     w_tau_smooth: float = 5.0e-2  # used in command filter
+    # State regularization reference mode:
+    # - "x0": current measured state at MPC solve (paper-faithful Eq. 19)
+    # - "q_nom": fixed nominal posture
+    posture_ref_mode: str = "x0"
     # Torque regularization target mode:
     # - "gravity_x0": tau_ref = tau_g(q0) each MPC update
     # - "gravity_qnom": tau_ref = tau_g(q_nom)
     # - "zero": tau_ref = 0
     torque_ref_mode: str = "gravity_x0"
-    w_tau_soft_limits: float = 2.0
+    w_tau_soft_limits: float = 0.0
     tau_soft_limit_margin: float = 0.2  # Nm kept away from hard bounds
-    w_q_soft_limits: float = 10.0
+    w_q_soft_limits: float = 0.0
     q_soft_limit_margin: float = 0.05  # rad
 
     # contact phase objectives
@@ -96,7 +100,7 @@ class ClassicalMPCConfig:
     use_box_fddp: bool = True
     mpc_update_steps: int = 1  # solve OCP every N control steps (>=1)
     use_feedback_policy: bool = True  # apply u = u_ff + K * dx between MPC solves
-    feedback_gain_scale: float = 0.2
+    feedback_gain_scale: float = 1.0
     verbose: bool = False
     debug_every: int = 25
     # numerical safety guard for solver blow-ups
@@ -149,6 +153,7 @@ class ClassicalCrocoddylMPC:
         obs0 = self.sim.get_observation(with_ee=True, with_jacobian=False)
         self.q_nom = np.asarray(obs0.q, dtype=float).copy()
         self.R_site_from_pin_ee = self._calibrate_site_rotation(obs0)
+        self.p_site_minus_frame_pin = self._calibrate_site_position_offset(obs0)
         self.R_des = self._rot_mj_to_pin(self._make_vertical_down_rotation_mj())
 
         self.xs: Optional[List[np.ndarray]] = None
@@ -205,6 +210,20 @@ class ClassicalCrocoddylMPC:
         # R_mj_site = R_mj_from_pin @ R_pin_ee @ R_site_from_pin_ee
         return R_pin_ee.T @ self.R_mj_from_pin.T @ R_mj_site
 
+    def _calibrate_site_position_offset(self, obs0) -> np.ndarray:
+        q0 = np.asarray(obs0.q, dtype=float)
+        pin.forwardKinematics(self.model, self.data, q0, np.zeros(self.model.nv))
+        pin.updateFramePlacements(self.model, self.data)
+        p_pin_ee = np.asarray(self.data.oMf[self.ee_fid].translation, dtype=float).copy()
+
+        if getattr(obs0, "ee_pos", None) is not None:
+            p_mj_site = np.asarray(obs0.ee_pos, dtype=float).reshape(3)
+        else:
+            p_mj_site = np.asarray(self.sim.data.site_xpos[self.sim.ee_site_id], dtype=float).reshape(3)
+
+        p_pin_site = self.R_mj_from_pin.T @ p_mj_site
+        return p_pin_site - p_pin_ee
+
     @staticmethod
     def _quat_wxyz_to_R(q: np.ndarray) -> np.ndarray:
         q = np.asarray(q, dtype=float).reshape(4)
@@ -229,7 +248,8 @@ class ClassicalCrocoddylMPC:
         return np.column_stack([x, y, z])
 
     def _pos_mj_to_pin(self, p_mj: np.ndarray) -> np.ndarray:
-        return self.R_mj_from_pin.T @ np.asarray(p_mj, dtype=float)
+        # Map MuJoCo EE-site position target to the Pinocchio EE-frame target.
+        return self.R_mj_from_pin.T @ np.asarray(p_mj, dtype=float) - self.p_site_minus_frame_pin
 
     def _vel_mj_to_pin(self, v_mj: np.ndarray) -> np.ndarray:
         return self.R_mj_from_pin.T @ np.asarray(v_mj, dtype=float)
@@ -294,7 +314,7 @@ class ClassicalCrocoddylMPC:
         if phase_mode == "force_latch":
             surface_now = self._detect_surface(obs, t, surf_hint_now)
         else:
-            # Paper-faithful baseline: phase comes from task schedule, not measured force.
+            # Paper-mode schedule: contact phase is provided by the reference trajectory.
             surface_now = bool(surf_hint_now)
 
         if self._prev_surface_mode is None:
@@ -439,6 +459,12 @@ class ClassicalCrocoddylMPC:
         # Default/paper-faithful: gravity centered at the current OCP linearization point.
         return self._gravity_torque(q_now)
 
+    def _compute_posture_reference(self, x0: np.ndarray) -> np.ndarray:
+        mode = str(self.cfg.posture_ref_mode).strip().lower()
+        if mode == "q_nom":
+            return np.concatenate([self.q_nom, np.zeros(self.model.nv, dtype=float)])
+        return np.asarray(x0, dtype=float).reshape(self.state.nx).copy()
+
     def _make_control_residual(self, u_ref: np.ndarray):
         u_ref = np.asarray(u_ref, dtype=float).reshape(self.actuation.nu)
         try:
@@ -495,6 +521,7 @@ class ClassicalCrocoddylMPC:
     def _build_problem(self, t0: float, x0: np.ndarray, surface_now: bool) -> crocoddyl.ShootingProblem:
         dt_ocp = self._dt_ocp
         tau_ref = self._compute_tau_reference(x0[: self.model.nq])
+        x_reg_ref = self._compute_posture_reference(x0)
         running = []
         for k in range(self.cfg.horizon):
             tk = t0 + k * dt_ocp
@@ -510,6 +537,7 @@ class ClassicalCrocoddylMPC:
                 surface_mode=surf_k,
                 terminal=False,
                 tau_ref=tau_ref,
+                x_reg_ref=x_reg_ref,
             )
             running.append(crocoddyl.IntegratedActionModelEuler(dam, dt_ocp))
 
@@ -522,6 +550,7 @@ class ClassicalCrocoddylMPC:
             surface_mode=bool(surface_now),
             terminal=True,
             tau_ref=tau_ref,
+            x_reg_ref=x_reg_ref,
         )
         terminal = crocoddyl.IntegratedActionModelEuler(terminal_dam, dt_ocp)
         return crocoddyl.ShootingProblem(x0, running, terminal)
@@ -533,11 +562,12 @@ class ClassicalCrocoddylMPC:
         surface_mode: bool,
         terminal: bool,
         tau_ref: np.ndarray,
+        x_reg_ref: np.ndarray,
     ):
         costs = crocoddyl.CostModelSum(self.state, self.actuation.nu)
 
-        # --- common posture + velocity damping (keep your structure) ---
-        x_ref = np.concatenate([self.q_nom, np.zeros(self.model.nv)])
+        # --- common state regularization ---
+        x_ref = np.asarray(x_reg_ref, dtype=float).reshape(self.state.nx)
         r_x = crocoddyl.ResidualModelState(self.state, x_ref, self.actuation.nu)
         costs.addCost("posture", crocoddyl.CostModelResidual(self.state, r_x), self.cfg.w_posture)
 
@@ -583,7 +613,7 @@ class ClassicalCrocoddylMPC:
         # ===========================
         if not surface_mode:
             r_pos = crocoddyl.ResidualModelFrameTranslation(self.state, self.ee_fid, p_ref, self.actuation.nu)
-            act_pos = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 1.5], dtype=float))
+            act_pos = crocoddyl.ActivationModelWeightedQuad(np.array([1.0, 1.0, 2.5], dtype=float))
             costs.addCost("ee_pos", crocoddyl.CostModelResidual(self.state, act_pos, r_pos), self.cfg.w_ee_pos)
 
             dam = crocoddyl.DifferentialActionModelFreeFwdDynamics(self.state, self.actuation, costs)
@@ -741,10 +771,7 @@ class ClassicalCrocoddylMPC:
             and i < len(self.Ks)
             and i < len(self.xs)
         ):
-            try:
-                dx = self.state.diff(x_now, self.xs[i])
-            except Exception:
-                dx = np.asarray(x_now - self.xs[i], dtype=float)
+            dx = np.asarray(x_now - self.xs[i], dtype=float)
             K = np.asarray(self.Ks[i], dtype=float)
             u += float(self.cfg.feedback_gain_scale) * (K @ dx)
 

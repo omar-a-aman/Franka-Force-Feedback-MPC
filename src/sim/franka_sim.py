@@ -14,6 +14,8 @@ class Observation:
     dq: np.ndarray                # (7,)
     tau_meas: np.ndarray          # (7,) measured-torque proxy (defaults to tau_total)
     tau_meas_filt: np.ndarray     # (7,) low-pass filtered measured-torque proxy
+    tau_meas_act: np.ndarray      # (7,) actuation-side torque proxy (tau_cmd + tau_act)
+    tau_meas_act_filt: np.ndarray # (7,) low-pass filtered actuation-side torque proxy
     tau_cmd: np.ndarray           # (7,) qfrc_applied command torque
     tau_act: np.ndarray           # (7,) MuJoCo actuator torque contribution
     tau_constraint: np.ndarray    # (7,) MuJoCo constraint/contact torque contribution
@@ -37,7 +39,8 @@ class FrankaMujocoSim:
       - applies u (7,) directly to qfrc_applied for the 7 arm DoFs
       - exposes explicit torque channels in Observation:
           tau_cmd (qfrc_applied), tau_act (qfrc_actuator),
-          tau_constraint (qfrc_constraint), tau_total, tau_meas_filt
+          tau_constraint (qfrc_constraint), tau_total,
+          tau_meas_filt (total-proxy LPF), tau_meas_act_filt (actuation-proxy LPF)
       - returns tau_bias so controllers can do gravity compensation
     """
 
@@ -95,6 +98,7 @@ class FrankaMujocoSim:
             raise ValueError(f"Missing geom '{ee_collision_geom_name}'")
 
         self._tau_meas_filt = np.zeros(7, dtype=np.float64)
+        self._tau_meas_act_filt = np.zeros(7, dtype=np.float64)
 
         # In torque mode we want qfrc_applied to be the only actuation source.
         # Panda's default actuators are position servos with nonzero bias terms;
@@ -123,7 +127,9 @@ class FrankaMujocoSim:
         tau_cmd = self.data.qfrc_applied[self.dof_adr].copy()
         tau_act = self.data.qfrc_actuator[self.dof_adr].copy()
         tau_constraint = self.data.qfrc_constraint[self.dof_adr].copy()
+        tau_meas_act = tau_cmd + tau_act
         self._tau_meas_filt = tau_cmd + tau_act + tau_constraint
+        self._tau_meas_act_filt = tau_meas_act.copy()
         return self.get_observation(with_ee=True, with_jacobian=True)
 
     def step(self, u: np.ndarray) -> Observation:
@@ -165,12 +171,15 @@ class FrankaMujocoSim:
         tau_cmd = self.data.qfrc_applied[self.dof_adr].copy()
         tau_act = self.data.qfrc_actuator[self.dof_adr].copy()
         tau_constraint = self.data.qfrc_constraint[self.dof_adr].copy()
+        tau_meas_act = tau_cmd + tau_act
         tau_total = tau_cmd + tau_act + tau_constraint
         # Measured effort proxy used by higher-level controllers; keep explicit and deterministic.
         tau_meas = tau_total.copy()
         a = self.tau_meas_lpf_alpha
         self._tau_meas_filt = (1.0 - a) * self._tau_meas_filt + a * tau_meas
         tau_meas_filt = self._tau_meas_filt.copy()
+        self._tau_meas_act_filt = (1.0 - a) * self._tau_meas_act_filt + a * tau_meas_act
+        tau_meas_act_filt = self._tau_meas_act_filt.copy()
 
         f_world, f_normal = self._ee_contact_force_world()
 
@@ -200,6 +209,8 @@ class FrankaMujocoSim:
             dq=dq,
             tau_meas=tau_meas,
             tau_meas_filt=tau_meas_filt,
+            tau_meas_act=tau_meas_act,
+            tau_meas_act_filt=tau_meas_act_filt,
             tau_cmd=tau_cmd,
             tau_act=tau_act,
             tau_constraint=tau_constraint,
