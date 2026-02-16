@@ -22,7 +22,12 @@ class Observation:
     tau_total: np.ndarray         # (7,) tau_cmd + tau_act + tau_constraint
     tau_bias: np.ndarray          # (7,) mujoco bias torque (gravity+coriolis)
     f_contact_world: np.ndarray   # (3,) total contact force ON ee geom, world
-    f_contact_normal: float       # scalar normal magnitude (>=0)
+    f_contact_normal: float       # scalar contact normal along table normal (>=0)
+    f_contact_normal_world_z: float  # scalar contact normal along world +z (>=0)
+    f_contact_tangent: float      # scalar tangential contact force magnitude
+    contact_count_ee: int         # number of active contacts involving ee geom
+    contact_count_table: int      # number of active ee<->table_contact contacts
+    table_normal_world: np.ndarray  # (3,) table surface normal in world frame
 
     ee_pos: Optional[np.ndarray] = None    # (3,)
     ee_quat: Optional[np.ndarray] = None   # (4,) (w,x,y,z)
@@ -96,6 +101,10 @@ class FrankaMujocoSim:
         self.ee_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, ee_collision_geom_name)
         if self.ee_geom_id < 0:
             raise ValueError(f"Missing geom '{ee_collision_geom_name}'")
+        self.table_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_top")
+        self.table_contact_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_contact")
+        if self.table_contact_geom_id < 0:
+            self.table_contact_geom_id = self.table_geom_id
 
         self._tau_meas_filt = np.zeros(7, dtype=np.float64)
         self._tau_meas_act_filt = np.zeros(7, dtype=np.float64)
@@ -181,7 +190,8 @@ class FrankaMujocoSim:
         self._tau_meas_act_filt = (1.0 - a) * self._tau_meas_act_filt + a * tau_meas_act
         tau_meas_act_filt = self._tau_meas_act_filt.copy()
 
-        f_world, f_normal = self._ee_contact_force_world()
+        f_world, f_normal, f_normal_z, f_tan, n_contacts_ee, n_contacts_table = self._ee_contact_force_world()
+        table_normal = self._table_normal_world()
 
         ee_pos = ee_quat = ee_vel = None
         J_pos = J_rot = None
@@ -218,6 +228,11 @@ class FrankaMujocoSim:
             tau_bias=tau_bias,
             f_contact_world=f_world,
             f_contact_normal=float(f_normal),
+            f_contact_normal_world_z=float(f_normal_z),
+            f_contact_tangent=float(f_tan),
+            contact_count_ee=int(n_contacts_ee),
+            contact_count_table=int(n_contacts_table),
+            table_normal_world=table_normal,
             ee_pos=ee_pos,
             ee_quat=ee_quat,
             ee_vel=ee_vel,
@@ -225,20 +240,36 @@ class FrankaMujocoSim:
             J_rot=J_rot,
         )
 
-    def _ee_contact_force_world(self) -> Tuple[np.ndarray, float]:
+    def _table_normal_world(self) -> np.ndarray:
+        table_geom_id = int(self.table_contact_geom_id)
+        if table_geom_id < 0:
+            table_geom_id = int(self.table_geom_id)
+        if table_geom_id < 0:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        R_table = self.data.geom_xmat[table_geom_id].reshape(3, 3)
+        n_table = np.asarray(R_table[:, 2], dtype=np.float64)
+        n_table /= (np.linalg.norm(n_table) + 1.0e-12)
+        return n_table
+
+    def _ee_contact_force_world(self) -> Tuple[np.ndarray, float, float, float, int, int]:
         """
         Returns force ON ee_collision geom in world coordinates.
         Correct MuJoCo conventions:
           mj_contactForce -> cf[0]=normal, cf[1]=friction1, cf[2]=friction2 (in contact frame)
-          contact.frame: 3x3 where first column is normal, next two are tangents (world coords)
+          contact.frame: frame[0:3]=normal, frame[3:6]=tangent1, frame[6:9]=tangent2
         """
         f_world_total = np.zeros(3, dtype=np.float64)
-        f_normal_total = 0.0
+        f_world_table = np.zeros(3, dtype=np.float64)
+        fn_table_total = 0.0
+        ft_table_total = 0.0
+        n_contacts_ee = 0
+        n_contacts_table = 0
 
         for i in range(self.data.ncon):
             c = self.data.contact[i]
             if (c.geom1 != self.ee_geom_id) and (c.geom2 != self.ee_geom_id):
                 continue
+            n_contacts_ee += 1
 
             cf = np.zeros(6, dtype=np.float64)
             mujoco.mj_contactForce(self.model, self.data, i, cf)
@@ -261,9 +292,34 @@ class FrankaMujocoSim:
                 f_w_on_ee = -f_w_on_geom2
 
             f_world_total += f_w_on_ee
-            f_normal_total += abs(fn)
+            other_geom = int(c.geom1) if int(c.geom2) == self.ee_geom_id else int(c.geom2)
+            if int(self.table_contact_geom_id) >= 0 and other_geom == int(self.table_contact_geom_id):
+                n_contacts_table += 1
+                # Contact-normal signal for control/metrics: scalar compression magnitude.
+                fn_table_total += abs(float(cf[0]))
+                ft_table_total += float(np.linalg.norm(cf[1:3]))
+                f_world_table += f_w_on_ee
 
-        return f_world_total, f_normal_total
+        if n_contacts_table > 0:
+            fn_world_z = max(float(f_world_table[2]), 0.0)
+            return (
+                f_world_table,
+                float(fn_table_total),
+                float(fn_world_z),
+                float(ft_table_total),
+                int(n_contacts_ee),
+                int(n_contacts_table),
+            )
+
+        fn_world_z = max(float(f_world_total[2]), 0.0)
+        return (
+            f_world_total,
+            0.0,
+            float(fn_world_z),
+            0.0,
+            int(n_contacts_ee),
+            0,
+        )
 
     @staticmethod
     def _mat_to_quat_wxyz(R: np.ndarray) -> np.ndarray:

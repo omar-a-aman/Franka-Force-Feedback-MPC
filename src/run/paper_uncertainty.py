@@ -98,8 +98,12 @@ class PaperUncertaintyInjector:
 
         self.a = float(self.rng.uniform(float(config.a_min), float(config.a_max)))
         self.b = float(self.rng.uniform(float(config.b_min), float(config.b_max)))
+        self.obs_delay_cycles_1khz = int(max(config.delta_obs_cycles, 0))
 
-        self.obs_delay_steps = int(max(config.delta_obs_cycles, 0))
+        # delta_obs_cycles in the paper is given at 1 kHz simulation rate.
+        # Convert it to the current control-step discretization.
+        obs_delay_s = float(self.obs_delay_cycles_1khz) * 1.0e-3
+        self.obs_delay_steps = int(max(np.round(obs_delay_s / self.dt), 0))
         self.cmd_delay_steps = int(max(np.round(float(config.delta_cmd_s) / self.dt), 0))
 
         self._obs_hist: deque[Observation] = deque(maxlen=self.obs_delay_steps + 1)
@@ -117,7 +121,8 @@ class PaperUncertaintyInjector:
             "sigma_q": float(self.cfg.sigma_q),
             "sigma_dq": float(self.cfg.sigma_dq),
             "sigma_tau": float(self.cfg.sigma_tau),
-            "delta_obs_cycles": int(self.obs_delay_steps),
+            "delta_obs_cycles_1khz": int(self.obs_delay_cycles_1khz),
+            "delta_obs_steps": int(self.obs_delay_steps),
             "delta_cmd_steps": int(self.cmd_delay_steps),
             "delta_cmd_s": float(self.cfg.delta_cmd_s),
             "seed": int(self.cfg.seed),

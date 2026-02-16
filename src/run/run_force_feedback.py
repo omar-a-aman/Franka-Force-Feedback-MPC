@@ -269,7 +269,7 @@ def _run_single(
 
     _, table_center, table_half, z_table_top = _table_geometry_world(sim)
     r_tool = float(sim.model.geom_size[sim.ee_geom_id][0])
-    z_contact_offset = -1.0e-2 if paper_mode else 2.0e-4
+    z_contact_offset = -8.0e-3 if paper_mode else 2.0e-4
     z_contact = z_table_top + r_tool + z_contact_offset
     z_pre = z_contact + (0.05 if paper_mode else 0.08)
 
@@ -281,8 +281,8 @@ def _run_single(
     print(f"Contact target: z_contact={z_contact:.4f}m (tool radius={r_tool:.4f}m)")
     print(f"Circle center (table center): {center}, radius={radius:.3f}m")
 
-    t_approach = 3.0 if paper_mode else 1.4
-    t_pre = 2.0 if paper_mode else 1.4
+    t_approach = 0.55 if paper_mode else 1.4
+    t_pre = 0.25 if paper_mode else 1.4
     traj_base = make_approach_then_circle(
         center=center,
         radius=radius,
@@ -294,7 +294,7 @@ def _run_single(
         t_pre=t_pre,
     )
     t_contact_phase = float(t_pre + t_approach)
-    t_contact_stabilize = 0.8 if paper_mode else 0.0
+    t_contact_stabilize = 0.2 if paper_mode else 0.0
 
     def traj(t_query: float):
         p_ref, v_ref, surf_ref = traj_base(t_query)
@@ -308,7 +308,7 @@ def _run_single(
     if mpc_iters is not None:
         max_iters = int(mpc_iters)
     elif paper_mode:
-        max_iters = 5
+        max_iters = 10
     else:
         max_iters = 3 if paper_budget else 10
     print(
@@ -318,60 +318,60 @@ def _run_single(
 
     if paper_mode:
         cfg = ForceFeedbackMPCConfig(
-            horizon=80,
+            horizon=40,
             dt=sim.dt,
             dt_ocp=0.01,
             z_contact=z_contact,
-            z_press=0.0,
+            z_press=0.0065,
             w_ee_pos=1.2e3,
-            w_ee_ori=1.0e2,
-            ori_weights=np.array([1.0, 1.0, 0.2], dtype=float),
-            w_posture=1.5e-1,
+            w_ee_ori=4.5e1,
+            ori_weights=np.array([2.2, 2.2, 0.3], dtype=float),
+            w_posture=1.0e-1,
             w_v=5.0e-2,
             posture_ref_mode="q_nom",
-            w_tau=5.0e-5,
+            w_tau=8.0e-4,
             w_w=6.0e-4,
-            w_w_soft_limits=1.0,
+            w_w_soft_limits=2.0,
             w_y=8.0e-4,
-            y_q_weights=np.array([0.07, 0.07, 0.07, 0.07, 0.04, 0.04, 0.04], dtype=float),
-            y_v_weights=np.array([0.03, 0.03, 0.03, 0.03, 0.02, 0.02, 0.02], dtype=float),
-            y_tau_weights=np.array([0.20, 0.20, 0.20, 0.20, 0.10, 0.10, 0.10], dtype=float),
+            y_q_weights=np.array([0.15, 0.15, 0.15, 0.15, 0.08, 0.08, 0.08], dtype=float),
+            y_v_weights=np.array([0.05, 0.05, 0.05, 0.05, 0.03, 0.03, 0.03], dtype=float),
+            y_tau_weights=np.array([0.12, 0.12, 0.12, 0.12, 0.08, 0.08, 0.08], dtype=float),
             use_inner_state_reg=True,
-            use_inner_tau_reg=False,
+            use_inner_tau_reg=True,
             torque_ref_mode="gravity_x0",
-            w_tau_soft_limits=1.0,
-            w_q_soft_limits=5.0,
+            w_tau_soft_limits=1.5,
+            w_q_soft_limits=8.0,
             q_soft_limit_margin=0.05,
             w_tau_smooth=0.0,
-            w_tangent_pos=9.0e2,
-            w_tangent_vel=0.0,
-            w_plane_z=9.0e2,
-            w_vz=0.0,
+            w_tangent_pos=3.2e3,
+            w_tangent_vel=1.0e3,
+            w_plane_z=1.1e3,
+            w_vz=4.0e2,
             w_friction_cone=0.0,
-            w_unilateral=2.0,
+            w_unilateral=3.0e1,
             mu=1.0,
-            contact_gains=np.array([0.0, 60.0], dtype=float),
-            fn_des=20.0,
-            w_fn=2.5e1,
-            w_wdamp=0.0,
-            w_wdamp_weights=np.array([1.0, 1.0, 0.2], dtype=float),
-            fn_contact_on=0.2,
-            fn_contact_off=0.05,
-            z_contact_band=0.02,
+            contact_gains=np.array([145.0, 85.0], dtype=float),
+            fn_des=22.0,
+            w_fn=3.4e1,
+            w_wdamp=7.0e1,
+            w_wdamp_weights=np.array([1.8, 1.8, 0.3], dtype=float),
+            fn_contact_on=1.0,
+            fn_contact_off=0.1,
+            z_contact_band=0.012,
             max_iters=max_iters,
-            mpc_update_steps=2,
+            mpc_update_steps=1,
             use_feedback_policy=True,
-            feedback_gain_scale=1.0,
+            feedback_gain_scale=0.45,
             max_solver_cost=1.0e8,
             max_tau_raw_inf=3.0e2,
             contact_release_steps=80,
-            contact_model="normal_1d",
-            phase_source="force_latch",
+            contact_model=contact_model,
+            phase_source=phase_source,
             apply_command_filter=False,
             strict_force_residual_dim=True,
-            ff_tau_state_source="tau_meas_act_filt",
-            ff_cutoff_hz=5.0,
-            ff_inverse_actuation_model=False,
+            ff_tau_state_source=ff_tau_state_source,
+            ff_cutoff_hz=25.0,
+            ff_inverse_actuation_model=True,
             ff_tau_feedback_gain=1.0,
             debug_every=100,
         )

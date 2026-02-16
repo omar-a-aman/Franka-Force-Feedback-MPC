@@ -10,14 +10,22 @@
 
   <worldbody>
    
+    <!-- Disable floor collisions for the sanding benchmark contact channel. -->
     <geom name="floor" type="plane" size="3 3 0.1" material="mat_checker"
-          friction="1 0.005 0.0001" contype="1" conaffinity="1"/>
+          friction="1 0.005 0.0001" contype="0" conaffinity="0"/>
 
     <body name="table" pos="-0.5 0.0 0.3">
+      <!-- Dedicated collision plane used by the controller/contact sensing. -->
+      <geom name="table_contact" type="plane" pos="0 0 0.02" size="1 1 0.02"
+            friction="0.2 0.001 0.0001"
+            condim="1"
+            margin="0.001"
+            contype="4" conaffinity="4" rgba="0.6 0.6 0.6 0.0"/>
+      <!-- Visual top only; side contacts are intentionally disabled. -->
       <geom name="table_top" type="box" size="0.35 0.35 0.02"
             rgba="0.6 0.6 0.6 1"
             friction="1 0.005 0.0001"
-            contype="1" conaffinity="1"/>
+            contype="0" conaffinity="0"/>
     </body>
   </worldbody>
 </mujoco>

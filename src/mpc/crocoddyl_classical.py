@@ -625,8 +625,9 @@ class ClassicalCrocoddylMPC:
         # ===========================
         contacts = crocoddyl.ContactModelMultiple(self.state, self.actuation.nu)
 
-        # Desired contact point (in WORLD): lock z to the plane while tracking x,y tangentially
-        z_target = float(self.cfg.z_contact) - float(self.cfg.z_press)
+        # Desired contact point for the EE frame in Pinocchio WORLD coordinates.
+        # p_ref is already the frame-consistent target converted from MuJoCo site refs.
+        z_target = float(p_ref[2]) - float(self.cfg.z_press)
         p_contact = p_ref.copy()
         p_contact[2] = z_target
 
