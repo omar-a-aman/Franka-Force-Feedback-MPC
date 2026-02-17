@@ -173,3 +173,11 @@ python3 src/run/run_force_feedback.py --scenario actuation_uncertainty --time 30
 
 - `assets/mujoco_menagerie/` is a vendored third-party asset bundle.
 - Project-specific scene files for this repository are in `assets/scenes/`.
+
+## References
+
+### Paper
+
+- S. Kleff, E. Dantec, G. Saurel, N. Mansard, and L. Righetti, "Introducing Force Feedback in Model Predictive Control," *IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS)*, 2022, pp. 13379-13385.
+- DOI: https://doi.org/10.1109/IROS47612.2022.9982003
+- Open-access entry: https://is.mpg.de/publications/forcefeedback_righetti2022
