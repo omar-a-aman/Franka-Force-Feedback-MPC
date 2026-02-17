@@ -31,14 +31,21 @@ Each major subfolder has its own README.
 
 ## Environment Setup
 
-### 1) Create and activate the conda environment
+### 1) Clone the repository (with submodules)
+
+```bash
+git clone --recurse-submodules https://github.com/omar-a-aman/Franka-Force-Feedback-MPC.git
+cd Franka-Force-Feedback-MPC
+```
+
+### 2) Create and activate the conda environment
 
 ```bash
 conda env create -f environment.yml
 conda activate franka-mpc
 ```
 
-### 2) Sanity-check key imports
+### 3) Sanity-check key imports
 
 ```bash
 python3 -c "import mujoco, crocoddyl, pinocchio; print('ok')"
