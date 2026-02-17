@@ -22,6 +22,9 @@ dependencies:
   # Video / visualization
   - imageio
   - imageio-ffmpeg
+  # LaTeX toolchain for matplotlib text.usetex rendering
+  - texlive-core
+  - perl
 
   # Dev tools
   - ipython

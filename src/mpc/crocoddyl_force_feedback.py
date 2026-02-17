@@ -138,7 +138,8 @@ class ForceFeedbackMPCConfig:
     ff_align_force_prediction: bool = True
     ff_align_window: int = 240
     ff_align_min_samples: int = 80
-    ff_align_corr_threshold: float = -0.2
+    ff_align_corr_threshold: float = 0.05
+    ff_align_max_lag: int = 8
     # Keep legacy knobs for backward compatibility with old logs/CLI, but
     # the augmented formulation no longer uses an external inverse LPF map.
     ff_inverse_actuation_model: bool = False
@@ -1319,26 +1320,55 @@ class ForceFeedbackCrocoddylMPC:
 
         raw = np.asarray(self._fn_pred_hist_raw, dtype=float)
         meas = np.asarray(self._fn_pred_hist_meas, dtype=float)
-        raw_c = raw - float(np.mean(raw))
-        meas_c = meas - float(np.mean(meas))
-        denom = float(np.linalg.norm(raw_c) * np.linalg.norm(meas_c))
-        if denom < 1.0e-9:
+        n = int(min(raw.size, meas.size))
+        if n < min_n:
             self._fn_pred_corr = np.nan
             return float(fn_pred_raw)
 
-        corr = float(np.dot(raw_c, meas_c) / denom)
+        max_lag = int(max(self.cfg.ff_align_max_lag, 0))
+        max_lag = min(max_lag, n - min_n)
+        corr_min = float(max(self.cfg.ff_align_corr_threshold, 0.0))
+
+        best = None  # (rmse, lag, corr, a, b)
+        for lag in range(max_lag + 1):
+            if lag > 0:
+                x = raw[:-lag]
+                y = meas[lag:]
+            else:
+                x = raw
+                y = meas
+            if x.size < min_n or y.size < min_n:
+                continue
+
+            x_c = x - float(np.mean(x))
+            y_c = y - float(np.mean(y))
+            denom = float(np.linalg.norm(x_c) * np.linalg.norm(y_c))
+            if denom < 1.0e-9:
+                continue
+            corr = float(np.dot(x_c, y_c) / denom)
+            if abs(corr) < corr_min:
+                continue
+
+            A = np.column_stack([x, np.ones_like(x)])
+            try:
+                a, b = np.linalg.lstsq(A, y, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                continue
+            fit = a * x + b
+            rmse = float(np.sqrt(np.mean((fit - y) ** 2)))
+            if (best is None) or (rmse < best[0]):
+                best = (rmse, lag, corr, float(a), float(b))
+
+        if best is None:
+            self._fn_pred_corr = np.nan
+            return float(fn_pred_raw)
+
+        _, lag, corr, a, b = best
         self._fn_pred_corr = corr
-        if corr <= float(self.cfg.ff_align_corr_threshold):
-            mu_r = float(np.mean(raw))
-            mu_m = float(np.mean(meas))
-            std_r = float(np.std(raw))
-            std_m = float(np.std(meas))
-            if std_r > 1.0e-9:
-                scale = std_m / std_r
-                fn_fit = mu_m - (float(fn_pred_raw) - mu_r) * scale
-                return float(max(fn_fit, 0.0))
-            return float(max(mu_m, 0.0))
-        return float(fn_pred_raw)
+        idx = max(0, raw.size - 1 - int(lag))
+        x_cur = float(raw[idx])
+        fn_fit = a * x_cur + b
+        return float(max(fn_fit, 0.0))
 
     def _make_contact_model_3d(self, p_contact: np.ndarray):
         gains = np.asarray(self.cfg.contact_gains, dtype=float).reshape(2)
