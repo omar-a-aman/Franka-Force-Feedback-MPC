@@ -58,6 +58,17 @@ def _style_reference_vs_measured(ax, t, ref, meas, ylabel: str):
     ax.grid(True)
 
 
+def _style_cartesian_xy(ax, ref_xy: np.ndarray, meas_xy: np.ndarray):
+    ax.plot(ref_xy[:, 0], ref_xy[:, 1], "-.", color="#4C6EF5", linewidth=1.8, label="Reference")
+    ax.plot(meas_xy[:, 0], meas_xy[:, 1], "-", color="#E03131", linewidth=1.4, label="Measured")
+    ax.set_xlabel(r"$p_x^{EE}\;(\mathrm{m})$")
+    ax.set_ylabel(r"$p_y^{EE}\;(\mathrm{m})$")
+    ax.set_title("End-Effector XY Cartesian Trajectory")
+    ax.legend(loc="best")
+    ax.grid(True)
+    ax.set_aspect("equal", adjustable="box")
+
+
 def save_evaluation_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     import matplotlib.pyplot as plt
 
@@ -146,4 +157,13 @@ def save_evaluation_plots(npz_path: Path, out_dir: Path, fn_des: float) -> None:
     ax.set_title("End-Effector Y Tracking")
     fig.tight_layout()
     fig.savefig(out_dir / "ee_py_ref_vs_meas.png", dpi=220)
+    plt.close(fig)
+
+    # 2D Cartesian tracking view in XY plane.
+    ref_xy = ee_ref[:, :2]
+    meas_xy = ee_pos[:, :2]
+    fig, ax = plt.subplots(figsize=(6.8, 6.2))
+    _style_cartesian_xy(ax, ref_xy, meas_xy)
+    fig.tight_layout()
+    fig.savefig(out_dir / "ee_xy_cartesian_ref_vs_meas.png", dpi=220)
     plt.close(fig)
