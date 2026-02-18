@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -8,6 +9,12 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 import pinocchio as pin
+
+# Allow running as a script: `python3 src/run/run_classical.py ...`
+if __package__ is None or __package__ == "":
+    _repo_root = Path(__file__).resolve().parents[2]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
 
 from src.mpc.crocoddyl_classical import ClassicalCrocoddylMPC, ClassicalMPCConfig
 from src.run.uncertainty_profiles import ScenarioUncertaintyInjector, config_for_scenario
