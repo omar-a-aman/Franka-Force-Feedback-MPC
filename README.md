@@ -176,6 +176,45 @@ python3 src/run/run_force_feedback.py --scenario actuation_uncertainty --time 30
   - use `--no-viewer`
   - reduce experiment time
 
+### ImportError: `CXXABI_1.3.15 not found` (Crocoddyl)
+
+If your shell has ROS/OpenRobots libraries in `LD_LIBRARY_PATH`, Crocoddyl may
+load the wrong `libstdc++` and fail with:
+
+`ImportError: /lib/x86_64-linux-gnu/libstdc++.so.6: version 'CXXABI_1.3.15' not found`
+
+Quick one-terminal fix (less isolated, but usually enough):
+
+```bash
+conda activate franka-mpc
+unset PYTHONPATH
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib"
+python -m src.run.run_classical --all-scenarios --time 20.0 --no-viewer
+```
+
+or 
+
+Use a clean runtime environment for the MPC commands:
+
+```bash
+env -i \
+HOME="$HOME" \
+PATH="$HOME/miniforge3/envs/franka-mpc/bin:/usr/bin:/bin" \
+LD_LIBRARY_PATH="$HOME/miniforge3/envs/franka-mpc/lib" \
+"$HOME/miniforge3/envs/franka-mpc/bin/python" \
+-m src.run.run_classical --all-scenarios --time 20.0 --no-viewer
+```
+
+```bash
+env -i \
+HOME="$HOME" \
+PATH="$HOME/miniforge3/envs/franka-mpc/bin:/usr/bin:/bin" \
+LD_LIBRARY_PATH="$HOME/miniforge3/envs/franka-mpc/lib" \
+"$HOME/miniforge3/envs/franka-mpc/bin/python" \
+-m src.run.run_force_feedback --all-scenarios --time 20.0 --no-viewer
+```
+
+
 ## Notes
 
 - `assets/mujoco_menagerie/` is a vendored third-party asset bundle.
